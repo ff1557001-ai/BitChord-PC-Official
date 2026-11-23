@@ -506,7 +506,7 @@ impl Mini {
     #[cfg(target_os = "linux")]
     pub(super) fn wayland_viewport(&self, builder: egui::ViewportBuilder) -> egui::ViewportBuilder {
         if self.active() {
-            let h = height(self.lyrics);
+            let h = SIZE.y;
             builder
                 .with_min_inner_size([MIN_W, h])
                 .with_max_inner_size([MAX_W, h])
