@@ -32,6 +32,8 @@ pub enum AudioCmd {
     Pause,
     Resume,
     Stop,
+    #[cfg(target_os = "linux")]
+    Shutdown,
     /// Another song is on its way: with crossfade on, fade this one out instead of
     /// stopping it, and fade the next one in when it starts.
     Handoff,
@@ -707,6 +709,12 @@ impl AudioHandle {
         let _ = self.tx.send(cmd);
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn shutdown(&self) {
+        self.status.wanted_gen.store(0, Ordering::Relaxed);
+        self.send(AudioCmd::Shutdown);
+    }
+
     pub fn volume(&self) -> f32 {
         f32::from_bits(self.status.volume.load(Ordering::Relaxed))
     }
@@ -1148,6 +1156,13 @@ fn run(
         // Poll while playing so the position stays fresh and the end is noticed; idle otherwise.
         let timeout = if (current != 0 || !fading.is_empty()) && !player.is_paused() { Duration::from_millis(100) } else { Duration::from_secs(3600) };
         match rx.recv_timeout(timeout) {
+            #[cfg(target_os = "linux")]
+            Ok(AudioCmd::Shutdown) => {
+                if let Some(stream) = shared.take() {
+                    stream.cancel();
+                }
+                break;
+            }
             Ok(AudioCmd::Start { generation, mut decoder, shared: s, at }) => {
                 if generation != status.wanted_gen.load(Ordering::Relaxed) {
                     log::debug!("audio: dropping stale generation {generation}");

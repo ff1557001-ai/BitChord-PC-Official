@@ -846,16 +846,17 @@ fn font_data(face: Face, y_offset_factor: f32) -> FontData {
 pub fn install_fonts(ctx: &egui::Context, ui_font: &str) {
     load_choice(ui_font);
     let ui_key = font_key(ui_font);
-    // Installing rebuilds the font atlas; most themes share a UI font, so skip repeats.
-    static INSTALLED: std::sync::Mutex<Option<(&'static str, String)>> = std::sync::Mutex::new(None);
-    let loaded = CHOICE.read().unwrap().as_ref().map(|c| c.name.clone()).unwrap_or_default();
-    let state = Some((ui_key, loaded));
-    {
-        let mut installed = INSTALLED.lock().unwrap();
-        if *installed == state {
-            return;
-        }
-        *installed = state;
+    let loaded = CHOICE
+        .read()
+        .unwrap()
+        .as_ref()
+        .map(|c| c.name.clone())
+        .unwrap_or_default();
+    let state = (ui_key, loaded);
+    // The font atlas belongs to this context, which Wayland replaces on Show.
+    let installed = egui::Id::unique("bitchord-installed-fonts");
+    if ctx.data(|d| d.get_temp(installed)).as_ref() == Some(&state) {
+        return;
     }
     let mut defs = FontDefinitions::default();
     let egui_default = defs.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
@@ -956,6 +957,25 @@ pub fn install_fonts(ctx: &egui::Context, ui_font: &str) {
         }
     }
     ctx.set_fonts(defs);
+    ctx.data_mut(|d| d.insert_temp(installed, state));
+}
+
+#[cfg(test)]
+#[test]
+fn fresh_contexts_install_the_same_named_fonts() {
+    for _ in 0..2 {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx, "inter");
+        install_fonts(&ctx, "inter");
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.ctx().fonts_mut(|fonts| {
+                assert!(fonts.has_glyph(&icon_font(14.0), icon::HOUSE));
+                assert!(fonts.has_glyph(&semibold(14.0), 'A'));
+                assert!(fonts.has_glyph(&bold(14.0), 'A'));
+            });
+        });
+        output.textures_delta.clear();
+    }
 }
 
 /// The first `Blob` seen for these bytes. Font bytes here are all `'static` (bundled, or

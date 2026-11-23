@@ -1,6 +1,6 @@
 [package]
 name = "bitchord"
-version = "2.0.1"
+version = "2.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/jackychan4891/BitChord-PC-Continued"
@@ -48,7 +48,6 @@ tao = "0.37.1"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
 wry = "0.57.0"
 rfd = "0.17.2"
-tray-icon = "0.26.1"
 url = "2.5.8"
 # The opt-in renderer: Vulkan, Metal on macOS (renderer.rs).
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "metal"] }
@@ -60,6 +59,9 @@ symphonia = { version = "0.5.5", default-features = false, features = ["mkv", "i
 rusty-opus = "1.0.2"
 unicode-bidi = "0.3"
 
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+tray-icon = "0.26.1"
+
 [target.'cfg(windows)'.dependencies]
 # Windows Credential Manager, for the Google and Spotify sign-ins.
 keyring = { version = "3.6.3", features = ["windows-native"] }
@@ -70,8 +72,14 @@ windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_
 [target.'cfg(target_os = "linux")'.dependencies]
 # The Secret Service (GNOME Keyring, KWallet) for the sign-ins.
 keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust"] }
-# The tray icon needs GTK running on a thread of its own.
-gtk = "0.18"
+# KSNI sends Activate events and uses the same StatusNotifierItem menu protocol.
+tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
+gio = "0.18"
+# Reuse eframe’s locked RON format when saving while the Wayland window is absent.
+ron = "0.12.2"
+tempfile = "3.27.0"
+# eframe’s X11 event-loop hook preserves backend selection when XWayland is available.
+winit = { version = "0.30.13", default-features = false, features = ["x11"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # The login Keychain for the sign-ins.

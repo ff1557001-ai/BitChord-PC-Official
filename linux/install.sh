@@ -42,27 +42,24 @@ cp "$here/install.sh" "$lib/install.sh"
 chmod 755 "$lib/install.sh"
 echo "Installed by install.sh. This file lets bitchord update itself." > "$lib/install.txt"
 ln -sf "$lib/bitchord" "$bin/bitchord"
-sed "s|^Exec=.*|Exec=$lib/bitchord|" "$here/bitchord.desktop" > "$desktop"
+sed "s|^Exec=bitchord|Exec=\"$lib/bitchord\"|" "$here/bitchord.desktop" > "$desktop"
 cp "$here/bitchord.png" "$icon"
 refresh
 
-# Libraries: WebKitGTK (sign-in, lyrics), GTK, the tray's appindicator and ALSA.
+# Libraries: WebKitGTK (sign-in, lyrics), GTK and ALSA.
 missing=$(ldd "$lib/bitchord" 2>/dev/null | awk '/not found/ { print $1 }' | tr '\n' ' ')
-# (Loaded at run time, so ldd doesn't list it. ldconfig is in /sbin, off a user's PATH on Debian.)
-ldconfig=$(command -v ldconfig || echo /sbin/ldconfig)
-appindicator=$("$ldconfig" -p 2>/dev/null | grep -c 'libayatana-appindicator3\|libappindicator3' || true)
-if [ -n "$missing" ] || [ "$appindicator" = 0 ]; then
+if [ -n "$missing" ]; then
     sudo=""
     [ "$(id -u)" = 0 ] || sudo=sudo
     echo "Installing the libraries bitchord needs${missing:+ ($missing)}"
     if command -v apt-get >/dev/null; then
-        $sudo apt-get install -y libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 libasound2
+        $sudo apt-get install -y libwebkit2gtk-4.1-0 libgtk-3-0 libasound2
     elif command -v dnf >/dev/null; then
-        $sudo dnf install -y webkit2gtk4.1 gtk3 libayatana-appindicator-gtk3 alsa-lib
+        $sudo dnf install -y webkit2gtk4.1 gtk3 alsa-lib
     elif command -v pacman >/dev/null; then
-        $sudo pacman -S --needed --noconfirm webkit2gtk-4.1 gtk3 libayatana-appindicator alsa-lib
+        $sudo pacman -S --needed --noconfirm webkit2gtk-4.1 gtk3 alsa-lib
     elif command -v zypper >/dev/null; then
-        $sudo zypper --non-interactive install libwebkit2gtk-4_1-0 libgtk-3-0 libayatana-appindicator3-1 alsa
+        $sudo zypper --non-interactive install libwebkit2gtk-4_1-0 libgtk-3-0 alsa
     else
         echo "Install these with your package manager: $missing"
     fi

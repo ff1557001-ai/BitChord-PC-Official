@@ -1286,6 +1286,54 @@ fn search(app: &mut App, ui: &mut Ui, q: &str, now: f64) {
     ui.add_space(18.0);
     let w = ui.available_width();
     super::shell::search_field(app, ui, w);
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = vec2(8.0, 0.0);
+        if widgets::chip(ui, "Online", !app.search_library_only).clicked() {
+            app.search_library_only = false;
+        }
+        if widgets::chip(ui, "In Library", app.search_library_only).clicked() {
+            app.search_library_only = true;
+        }
+    });
+
+    if app.search_library_only {
+        let q_input = app.search_text.trim();
+        let all_local = crate::downloads::list();
+        let matches: Vec<Track> = if q_input.is_empty() {
+            all_local
+        } else {
+            let q_lower = q_input.to_lowercase();
+            all_local.into_iter().filter(|t| {
+                t.title.to_lowercase().contains(&q_lower)
+                    || t.artists.iter().any(|a| a.name.to_lowercase().contains(&q_lower))
+                    || t.album.as_ref().map(|l| l.name.as_str()).unwrap_or("").to_lowercase().contains(&q_lower)
+            }).collect()
+        };
+
+        ui.add_space(14.0);
+        if matches.is_empty() {
+            ui.add_space(18.0);
+            ui.label(RichText::new("No songs found in local library").font(theme::bold(20.0)).color(theme::text()));
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("No downloaded or synced local tracks match \"{}\".", q_input)).font(theme::regular(14.0)).color(theme::text_dim()));
+            return;
+        }
+
+        ui.label(RichText::new(format!("Library Results ({})", matches.len())).font(theme::bold(22.0)).color(theme::text()));
+        ui.add_space(10.0);
+        let rows = Rows::new(app, now);
+        let liked = &app.liked;
+        let acts = &mut app.actions;
+        for (i, t) in matches.iter().enumerate() {
+            let o = RowOpts { pick, ..rows.opts(liked, t, None, true) };
+            if track_row(ui, t, &o, acts).clicked() {
+                acts.push(if pick { Action::TransferPick(t.clone()) } else { Action::Play(matches.clone(), i) });
+            }
+        }
+        return;
+    }
+
     if q.trim().is_empty() {
         ui.add_space(22.0);
         recent_searches(ui, app);
@@ -1506,6 +1554,7 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
     };
     // The header keeps its still sleeve: moving artwork belongs to the player.
     let sprite: Option<widgets::MotionSprite> = None;
+    let accent = app.accent_color();
     let Some(o) = app.lists.get(id) else { return };
     let (c, more) = (&o.c, app.receiving(id));
     let acts = &mut app.actions;
@@ -1519,6 +1568,7 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
     ui.add_space(18.0);
     ui.horizontal_top(|ui| {
         let (img, _) = ui.allocate_exact_size(Vec2::splat(COVER), Sense::hover());
+        widgets::ambient_shadow(ui, img, theme::card_radius() + 2.0, 42.0, theme::with_alpha(accent, 0.35));
         widgets::soft_shadow(ui, img, 10.0, 40.0, 0.5);
         if id == super::LIKED_MUSIC {
             ui.painter().rect_filled(img, theme::card_radius() + 2.0, Color32::from_rgb(245, 245, 247));
@@ -1534,7 +1584,15 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
             ui.set_max_width(ui.available_width().min(760.0));
             // Apple sets the name over the cover's lower half with no kind eyebrow above it.
             ui.add_space(if is_album { 30.0 } else { 72.0 });
-            ui.label(RichText::new(if id == super::LIKED_MUSIC { "Favourite Songs" } else { &c.title }).font(theme::bold(42.0)).color(theme::text()));
+            // A logo the listener dropped on this release takes the name's place.
+            let logo = crate::album_logo::has_logo(app.backend.data_dir(), id);
+            if logo {
+                let path = crate::album_logo::logo_path(app.backend.data_dir(), id);
+                let uri = format!("file://{}", path.to_string_lossy().replace('\\', "/"));
+                ui.add(egui::Image::new(&uri).max_height(64.0).max_width(ui.available_width().min(380.0)).fit_to_original_size(1.0));
+            } else {
+                ui.label(RichText::new(if id == super::LIKED_MUSIC { "Favourite Songs" } else { &c.title }).font(theme::bold(42.0)).color(theme::text()));
+            }
             ui.add_space(4.0);
             if id != super::LIKED_MUSIC {
                 let (byline_size, byline_color) = if is_album { (15.0, theme::text_dim()) } else { (21.0, theme::text()) };
@@ -1579,6 +1637,14 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
                 egui::Popup::menu(&more).show(|ui| {
                     ui.set_width(226.0);
                     ui.add_space(3.0);
+                    if !tracks.is_empty()
+                        && widgets::menu_action(ui, Some(icon::DOWNLOAD), "Download all songs")
+                    {
+                        let to_dl: Vec<Track> = tracks.iter().filter(|t| crate::downloads::path(&t.id).is_none()).cloned().collect();
+                        if !to_dl.is_empty() {
+                            acts.push(Action::DownloadBatch(to_dl));
+                        }
+                    }
                     if let Some(first) = tracks.first()
                         && widgets::menu_action(ui, Some(icon::RADIO), "Start radio")
                     {
@@ -1616,6 +1682,24 @@ fn collection(app: &mut App, ui: &mut Ui, id: &str, now: f64) {
                     }
                     if widgets::menu_action(ui, Some(icon::LINK), "Share") {
                         acts.push(Action::Share(target.clone()));
+                    }
+                    ui.separator();
+                    let has_custom_logo = crate::album_logo::has_logo(app.backend.data_dir(), id);
+                    if widgets::menu_action(ui, Some(icon::SPARKLES), "Set custom title logo (PNG)...") {
+                        let data_dir = app.backend.data_dir().to_owned();
+                        let target_id = id.to_owned();
+                        std::thread::spawn(move || {
+                            if let Some(file) = rfd::FileDialog::new()
+                                .set_title("Select PNG Title Logo")
+                                .add_filter("PNG Image", &["png"])
+                                .pick_file()
+                            {
+                                let _ = crate::album_logo::save_logo(&data_dir, &target_id, &file);
+                            }
+                        });
+                    }
+                    if has_custom_logo && widgets::menu_action(ui, Some(icon::TRASH_2), "Remove title logo") {
+                        crate::album_logo::remove_logo(app.backend.data_dir(), id);
                     }
                     ui.add_space(3.0);
                 });
@@ -2539,9 +2623,15 @@ fn downloads(app: &mut App, ui: &mut Ui, now: f64) {
                 .color(theme::text_dim()),
         );
         ui.add_space(10.0);
-        if pill(ui, "Open folder", Some(icon::FOLDER_OPEN), false).clicked() {
-            crate::downloads::open_folder();
-        }
+        ui.horizontal(|ui| {
+            if pill(ui, "Sync folder", None, false).clicked() {
+                crate::downloads::sync_local_files();
+                app.toast("Synced local music folder");
+            }
+            if pill(ui, "Open folder", Some(icon::FOLDER_OPEN), false).clicked() {
+                crate::downloads::open_folder();
+            }
+        });
         return;
     }
     ui.horizontal(|ui| {
@@ -2550,6 +2640,10 @@ fn downloads(app: &mut App, ui: &mut Ui, now: f64) {
         }
         if pill(ui, "Shuffle", Some(icon::SHUFFLE), false).clicked() {
             app.actions.push(Action::PlayShuffled(songs.clone()));
+        }
+        if pill(ui, "Sync folder", None, false).clicked() {
+            crate::downloads::sync_local_files();
+            app.toast("Synced local music folder");
         }
         if pill(ui, "Open folder", Some(icon::FOLDER_OPEN), false).clicked() {
             crate::downloads::open_folder();
@@ -2872,6 +2966,25 @@ fn settings_playback(app: &mut App, ui: &mut Ui) {
             if toggle(ui, &mut app.sponsorblock, "Skip non-music parts").changed() {
                 app.request_segments();
             }
+        });
+        divider(ui);
+        setting_row(ui, "Sleep timer", Some("Pause playback when a half-hour timer runs out, easing the volume down over its last 30 seconds instead of stopping mid-song."), |ui| {
+            ui.horizontal(|ui| {
+                if pill(ui, if app.sleep_timer.is_some() { "Cancel timer" } else { "30 min timer" }, None, app.sleep_timer.is_some()).clicked() {
+                    if app.sleep_timer.is_some() {
+                        app.sleep_timer = None;
+                        if let Some(vol) = app.sleep_base_volume.take() {
+                            app.audio.send(crate::audio::AudioCmd::Volume(vol));
+                        }
+                    } else {
+                        app.sleep_timer = Some(std::time::Instant::now() + std::time::Duration::from_secs(30 * 60));
+                    }
+                }
+                if let Some(target) = app.sleep_timer {
+                    let rem = target.saturating_duration_since(std::time::Instant::now());
+                    ui.label(RichText::new(format!("Pauses in {:02}:{:02}", rem.as_secs() / 60, rem.as_secs() % 60)).font(theme::regular(13.0)).color(theme::text_dim()));
+                }
+            });
         });
     });
     settings_equalizer(app, ui);
@@ -3313,6 +3426,10 @@ fn settings_appearance(app: &mut App, ui: &mut Ui) {
             toggle(ui, &mut app.disable_blur, "Power saver / Disable background blur");
         });
         divider(ui);
+        setting_row(ui, "Power saver / Disable background blur", Some("Replaces intensive GPU shader blur effects with a clean static ambient tint. Drastically reduces GPU usage, heat and battery consumption on integrated GPUs."), |ui| {
+            toggle(ui, &mut app.disable_blur, "Power saver / Disable background blur");
+        });
+        divider(ui);
         setting_row(ui, "Font", Some("For the whole app and the lyrics. Any font installed on this PC works, e.g. one made for your language."), |ui| {
             if let Some(name) = font_picker(ui) {
                 theme::set_font_choice(&name);
@@ -3389,6 +3506,7 @@ fn settings_player(app: &mut App, ui: &mut Ui) {
 fn settings_window(app: &mut App, ui: &mut Ui) {
     section_label(ui, "Window", None);
     settings_card(ui, |ui| {
+        #[cfg(not(target_os = "linux"))]
         setting_row(ui, "Close to tray", Some("Clicking × hides the window and keeps the music playing. Click the tray icon to bring it back, or right-click it to quit."), |ui| {
             toggle(ui, &mut app.close_to_tray, "Close to tray");
         });

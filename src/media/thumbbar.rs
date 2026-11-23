@@ -9,12 +9,13 @@ use souvlaki::MediaControlEvent;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS, DeleteObject};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Shell::{
     DefSubclassProc, ITaskbarList3, SetWindowSubclass, THB_FLAGS, THB_ICON, THB_TOOLTIP, THBF_ENABLED, THBN_CLICKED, THUMBBUTTON, TaskbarList,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    ChangeWindowMessageFilterEx, CreateIconIndirect, HICON, ICONINFO, IsWindowVisible, MSGFLT_ALLOW, KillTimer, RegisterWindowMessageW, SM_CXSMICON, SetTimer, WM_COMMAND, WM_SHOWWINDOW, WM_TIMER,
+    ChangeWindowMessageFilterEx, CreateIconIndirect, HICON, ICONINFO, IsWindowVisible, MSGFLT_ALLOW, KillTimer, RegisterWindowMessageW, SM_CXSMICON, SetTimer, WM_COMMAND, WM_SETTINGCHANGE, WM_SHOWWINDOW, WM_THEMECHANGED, WM_TIMER,
 };
 use windows::core::w;
 
@@ -32,6 +33,7 @@ pub struct ThumbBar {
     prev: HICON,
     next: HICON,
     playing: bool,
+    light: bool,
 }
 
 /// What the subclass needs to forward a click.
@@ -57,14 +59,16 @@ impl ThumbBar {
                 .ok()?;
             taskbar.HrInit().ok()?;
             let px = GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForWindow(hwnd)).max(16);
+            let light = system_taskbar_is_light();
             let bar = ThumbBar {
                 hwnd,
                 taskbar,
-                play: icon(px, Glyph::Play)?,
-                pause: icon(px, Glyph::Pause)?,
-                prev: icon(px, Glyph::Prev)?,
-                next: icon(px, Glyph::Next)?,
+                play: icon(px, Glyph::Play, light)?,
+                pause: icon(px, Glyph::Pause, light)?,
+                prev: icon(px, Glyph::Prev, light)?,
+                next: icon(px, Glyph::Next, light)?,
                 playing: false,
+                light,
             };
             // The taskbar button exists only once the window shows (eframe shows it
             // after the first frame), and buttons added before then never appear.
@@ -107,6 +111,24 @@ impl ThumbBar {
             let _ = unsafe { self.taskbar.ThumbBarUpdateButtons(self.hwnd, &self.buttons()) };
         }
     }
+
+    pub fn reload_icons(&mut self) {
+        let light = system_taskbar_is_light();
+        let px = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForWindow(self.hwnd)).max(16) };
+        if let (Some(play), Some(pause), Some(prev), Some(next)) = (
+            icon(px, Glyph::Play, light),
+            icon(px, Glyph::Pause, light),
+            icon(px, Glyph::Prev, light),
+            icon(px, Glyph::Next, light),
+        ) {
+            self.play = play;
+            self.pause = pause;
+            self.prev = prev;
+            self.next = next;
+            self.light = light;
+            let _ = unsafe { self.taskbar.ThumbBarUpdateButtons(self.hwnd, &self.buttons()) };
+        }
+    }
 }
 
 fn button(id: u32, icon: HICON, tip: &str) -> THUMBBUTTON {
@@ -146,6 +168,15 @@ unsafe extern "system" fn subclass(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM,
             && let Some(bar) = bar.as_ref()
         {
             bar.add();
+        }
+    }
+    if msg == WM_SETTINGCHANGE || msg == WM_THEMECHANGED {
+        if let Ok(mut bar) = unsafe { &*hook.bar }.try_borrow_mut()
+            && let Some(bar) = bar.as_mut()
+        {
+            if bar.light != system_taskbar_is_light() {
+                bar.reload_icons();
+            }
         }
     }
     unsafe { DefSubclassProc(hwnd, msg, wp, lp) }
@@ -210,7 +241,26 @@ fn raster(px: i32, g: Glyph) -> Vec<u8> {
     out
 }
 
-fn icon(px: i32, g: Glyph) -> Option<HICON> {
+fn system_taskbar_is_light() -> bool {
+    let mut v = 0u32;
+    let mut size = 4u32;
+    unsafe {
+        if RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
+            w!("SystemUsesLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut v as *mut u32 as *mut _),
+            Some(&mut size),
+        ).is_ok() {
+            return v != 0;
+        }
+    }
+    crate::theme::light()
+}
+
+fn icon(px: i32, g: Glyph, light: bool) -> Option<HICON> {
     let alpha = raster(px, g);
     unsafe {
         let info = BITMAPINFO {
@@ -228,8 +278,13 @@ fn icon(px: i32, g: Glyph) -> Option<HICON> {
         let mut bits = std::ptr::null_mut();
         let color = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
         let dst = std::slice::from_raw_parts_mut(bits as *mut u32, alpha.len());
+        let rgb: u32 = if light {
+            0x0018_1818 // Dark slate for light mode taskbar
+        } else {
+            0x00ff_ffff // White for dark mode taskbar
+        };
         for (d, a) in dst.iter_mut().zip(&alpha) {
-            *d = (*a as u32) << 24 | 0x00ff_ffff;
+            *d = (*a as u32) << 24 | rgb;
         }
         let mask = CreateBitmap(px, px, 1, 1, None);
         let icon = CreateIconIndirect(&ICONINFO { fIcon: true.into(), xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color }).ok();

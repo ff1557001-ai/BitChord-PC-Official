@@ -51,10 +51,13 @@ pub fn default_folder() -> PathBuf {
 pub fn init(data_dir: &Path, folder: &str) {
     let file = data_dir.join("downloads.json");
     let index = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-    let mut st = STATE.write().unwrap();
-    st.index = index;
-    st.file = file;
-    st.folder = if folder.is_empty() { default_folder() } else { PathBuf::from(folder) };
+    {
+        let mut st = STATE.write().unwrap();
+        st.index = index;
+        st.file = file;
+        st.folder = if folder.is_empty() { default_folder() } else { PathBuf::from(folder) };
+    }
+    sync_local_files();
 }
 
 pub fn folder() -> PathBuf {
@@ -121,6 +124,7 @@ pub fn path(video_id: &str) -> Option<PathBuf> {
 
 /// The downloaded songs still on disk, newest first.
 pub fn list() -> Vec<Track> {
+    sync_local_files();
     let st = STATE.read().unwrap();
     let mut out: Vec<(std::time::SystemTime, Track)> = st
         .index
@@ -148,6 +152,100 @@ pub fn open(video_id: &str) -> Option<Arc<Shared>> {
     let (_, format) = sniff(&data);
     log::info!("{video_id}: playing the downloaded file");
     Some(Shared::from_bytes_with_format(data, entry.duration_ms, entry.loudness_db, format, None))
+}
+
+/// Scan the download/music folder for preinstalled audio files that aren't yet in the index.
+pub fn sync_local_files() {
+    let folder = folder();
+    if !folder.is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&folder) else {
+        return;
+    };
+    let mut updated = false;
+    let mut st = STATE.write().unwrap();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') || name.ends_with(".part") {
+            continue;
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        if !matches!(ext.as_str(), "mp3" | "flac" | "m4a" | "opus" | "ogg" | "wav" | "aac" | "webm") {
+            continue;
+        }
+        if st.index.values().any(|e| e.path == path) {
+            continue;
+        }
+
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Unknown");
+        let (artist_name, title_name) = if let Some((artist, title)) = stem.split_once(" - ") {
+            (artist.trim(), title.trim())
+        } else {
+            ("Local Music", stem.trim())
+        };
+
+        let mut final_title = title_name.to_owned();
+        let mut final_artist = artist_name.to_owned();
+        let mut final_album = None;
+        let mut duration_ms = 0;
+
+        if ext == "m4a" {
+            if let Ok(tag) = mp4ameta::Tag::read_from_path(&path) {
+                if let Some(t) = tag.title() {
+                    final_title = t.to_owned();
+                }
+                if let Some(a) = tag.artist() {
+                    final_artist = a.to_owned();
+                }
+                if let Some(al) = tag.album() {
+                    final_album = Some(crate::model::Link { name: al.to_owned(), id: None });
+                }
+                let d = tag.duration();
+                if d.as_millis() > 0 {
+                    duration_ms = d.as_millis() as u64;
+                }
+            }
+        }
+
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.to_string_lossy().hash(&mut hasher);
+        let id = format!("local:{:016x}", hasher.finish());
+
+        let track = Track {
+            id: id.clone(),
+            title: final_title,
+            artists: vec![crate::model::Link { name: final_artist, id: None }],
+            album: final_album,
+            duration: if duration_ms > 0 { Some((duration_ms / 1000) as u32) } else { None },
+            thumbs: Vec::new(),
+            track_nr: None,
+            plays: None,
+            music_video: false,
+            episode: false,
+        };
+
+        st.index.insert(id, Entry {
+            path,
+            duration_ms,
+            loudness_db: None,
+            stands_for: None,
+            song: Some(track),
+        });
+        updated = true;
+    }
+    if updated {
+        if let Ok(json) = serde_json::to_vec(&st.index) {
+            let _ = std::fs::write(&st.file, json);
+        }
+    }
 }
 
 /// Write a downloaded song into the folder and remember it. Returns the file.

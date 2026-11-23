@@ -104,6 +104,40 @@ fn run(bin: &Path, data_dir: &Path, video_id: &str, cookie: &str) -> anyhow::Res
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
+    cmd.stdin(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+    #[cfg(target_os = "linux")]
+    let out = crate::child_process::HELPERS.output(&mut cmd, Some(Duration::from_secs(90)))?;
+    #[cfg(not(target_os = "linux"))]
+    let out = watched_output(&mut cmd)?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let line = err.lines().rfind(|l| l.contains("ERROR")).unwrap_or("yt-dlp failed");
+        anyhow::bail!("{}", line.trim_start_matches("ERROR: ").trim());
+    }
+    let v: Value = serde_json::from_slice(&out.stdout)?;
+    // yt-dlp writes the cookies back, with any Google replaced while it ran.
+    let replaced = std::fs::read_to_string(&jar)
+        .unwrap_or_default()
+        .lines()
+        // HttpOnly cookies (the session ones) may be written as `#HttpOnly_.youtube.com…`.
+        .map(|l| l.strip_prefix("#HttpOnly_").unwrap_or(l))
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f.len() >= 7 && f[0].trim_start_matches('.').eq_ignore_ascii_case("youtube.com")).then(|| format!("{}={}; Domain=.youtube.com", f[5], f[6]))
+        })
+        .collect();
+    Ok(Stream {
+        replaced,
+        url: v["url"].as_str().ok_or_else(|| anyhow::anyhow!("yt-dlp returned no URL"))?.to_owned(),
+        size: v["filesize"].as_u64().unwrap_or(0),
+        duration_ms: v["duration"].as_f64().map_or(0, |d| (d * 1000.0) as u64),
+        user_agent: v["http_headers"]["User-Agent"].as_str().unwrap_or_default().to_owned(),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn watched_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
     // Its own process group, so the whole tree (the onefile binary unpacks into a child,
     // plus Node) can be ended together.
     #[cfg(unix)]
@@ -140,30 +174,5 @@ fn run(bin: &Path, data_dir: &Path, video_id: &str, cookie: &str) -> anyhow::Res
     });
     let out = child.wait_with_output();
     done.store(true, std::sync::atomic::Ordering::Relaxed);
-    let out = out?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let line = err.lines().rfind(|l| l.contains("ERROR")).unwrap_or("yt-dlp failed");
-        anyhow::bail!("{}", line.trim_start_matches("ERROR: ").trim());
-    }
-    let v: Value = serde_json::from_slice(&out.stdout)?;
-    // yt-dlp writes the cookies back, with any Google replaced while it ran.
-    let replaced = std::fs::read_to_string(&jar)
-        .unwrap_or_default()
-        .lines()
-        // HttpOnly cookies (the session ones) may be written as `#HttpOnly_.youtube.com…`.
-        .map(|l| l.strip_prefix("#HttpOnly_").unwrap_or(l))
-        .filter(|l| !l.starts_with('#'))
-        .filter_map(|l| {
-            let f: Vec<&str> = l.split('\t').collect();
-            (f.len() >= 7 && f[0].trim_start_matches('.').eq_ignore_ascii_case("youtube.com")).then(|| format!("{}={}; Domain=.youtube.com", f[5], f[6]))
-        })
-        .collect();
-    Ok(Stream {
-        replaced,
-        url: v["url"].as_str().ok_or_else(|| anyhow::anyhow!("yt-dlp returned no URL"))?.to_owned(),
-        size: v["filesize"].as_u64().unwrap_or(0),
-        duration_ms: v["duration"].as_f64().map_or(0, |d| (d * 1000.0) as u64),
-        user_agent: v["http_headers"]["User-Agent"].as_str().unwrap_or_default().to_owned(),
-    })
+    out
 }

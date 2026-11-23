@@ -361,8 +361,9 @@ impl App {
                     self.accent = art.accent;
                     self.frost_art = Some((key.clone(), art.rgba.clone()));
                     if let Some(bg) = &self.bg {
-                        bg.set_art(art);
+                        bg.set_art(art.clone());
                     }
+                    self.background_art = Some(art);
                     self.art_key = Some(key);
                     self.art_changed = now;
                 }

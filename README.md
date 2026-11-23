@@ -1,5 +1,5 @@
 <div align="center">
-  <h1>BitChord PC Continued</h1>
+  <h1>BitChord PC - Official</h1>
   <p><strong>A fast, native YouTube Music desktop app — rebuilt in Rust.</strong></p>
   <p>Built with egui and rodio. No Electron, no embedded browser player, and light on memory while playing.</p>
 
@@ -8,12 +8,6 @@
     <a href="https://github.com/jackychan4891/BitChord-PC-Continued/releases"><img src="https://img.shields.io/github/downloads/jackychan4891/BitChord-PC-Continued/total?style=flat-square&color=a855f7&labelColor=0d1117" alt="Downloads"></a>
     <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-333?style=flat-square&labelColor=0d1117" alt="Platforms">
     <a href="LICENSE"><img src="https://img.shields.io/github/license/jackychan4891/BitChord-PC-Continued?style=flat-square&color=333&labelColor=0d1117" alt="License: GPL-3.0"></a>
-  </p>
-
-  <p>
-    <a href="https://github.com/jackychan4891/BitChord-PC-Continued/releases/latest">Download</a> ·
-    <a href="#features">Features</a> ·
-    <a href="#installation">Installation</a>
   </p>
 </div>
 
@@ -72,6 +66,11 @@ Download the latest build from [Releases](https://github.com/jackychan4891/BitCh
 
 - **Windows** — download the Windows release asset, extract/install it, and run `bitchord.exe`.
 - **macOS / Linux** — use the platform release assets when available.
+
+On Linux, BitChord keeps a system tray icon on X11 and XWayland when the desktop
+provides a StatusNotifierItem tray. Closing the window keeps playback running.
+Use **Show** to restore it or **Quit** to exit. Without a tray host, closing the
+window exits. See the [Linux tray requirements and verification notes](docs/linux-tray.md).
 
 If Windows SmartScreen appears for an unsigned build, choose **More info → Run anyway**.
 

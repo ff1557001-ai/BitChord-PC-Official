@@ -1,140 +1,196 @@
-//! System tray icon, shown while "Close to tray" has hidden the window.
-//!
-//! The icon must be created on the UI thread (it owns a Win32 message window), so
-//! the app creates and drops it from `logic`. Clicks arrive on that thread's message
-//! loop; they are queued here and the UI is woken to handle them. On macOS it is a
-//! menu bar item, made the same way (AppKit wants it on the main thread, which is the
-//! UI thread there).
-//!
-//! On Linux the icon is a GTK one, and GTK runs its own loop on one thread for the
-//! life of the process (it can't be started twice); the icon is made and dropped there.
+//! The Linux tray lives on its own worker thread until app shutdown. Windows and
+//! macOS create it on the UI thread only when closing to the tray.
 
-use std::sync::{Mutex, Once};
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub(crate) mod wayland;
+mod window;
 
+use std::sync::{
+    Arc, Mutex, Once,
+    atomic::{AtomicU64, Ordering},
+};
+
+use crossbeam_channel::{Receiver, Sender};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{
+    MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent, TrayIconId,
+};
+
+#[cfg(target_os = "linux")]
+pub use linux::finish;
+pub use window::{Action, Window};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cmd {
+    #[cfg(target_os = "linux")]
+    Hide,
     Show,
     Quit,
 }
 
-static PENDING: Mutex<Vec<Cmd>> = Mutex::new(Vec::new());
+struct Events {
+    id: TrayIconId,
+    toggle_id: String,
+    quit_id: String,
+    toggle: Cmd,
+    tx: Sender<Cmd>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+static EVENTS: Mutex<Option<Events>> = Mutex::new(None);
 
 pub struct Tray {
+    id: TrayIconId,
+    rx: Receiver<Cmd>,
     #[cfg(not(target_os = "linux"))]
     _icon: TrayIcon,
+    #[cfg(target_os = "linux")]
+    worker: linux::Worker,
 }
 
 impl Tray {
-    /// `wake` is called (from the UI thread's message loop) after each click.
-    pub fn new(icon: &crate::appicon::Variant, wake: impl Fn() + Send + Sync + Clone + 'static) -> anyhow::Result<Self> {
-        // The handlers are process-wide and can only be set once.
+    pub fn new(
+        icon: &'static crate::appicon::Variant,
+        wake: impl Fn() + Send + Sync + Clone + 'static,
+    ) -> anyhow::Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         static HANDLERS: Once = Once::new();
         HANDLERS.call_once(|| {
-            let w = wake.clone();
-            TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
-                if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
-                    push(Cmd::Show, &w);
+            TrayIconEvent::set_event_handler(Some(|event| {
+                if let TrayIconEvent::Click {
+                    id,
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } = event
+                {
+                    dispatch(|e| (e.id == id).then_some(Cmd::Show));
                 }
             }));
-            MenuEvent::set_event_handler(Some(move |e: MenuEvent| match e.id.as_ref() {
-                "show" => push(Cmd::Show, &wake),
-                "quit" => push(Cmd::Quit, &wake),
-                _ => {}
+            MenuEvent::set_event_handler(Some(|event: MenuEvent| {
+                dispatch(|e| {
+                    if event.id.as_ref() == e.toggle_id {
+                        Some(e.toggle)
+                    } else if event.id.as_ref() == e.quit_id {
+                        Some(Cmd::Quit)
+                    } else {
+                        None
+                    }
+                });
             }));
         });
 
-        let png = icon.rgba(32).ok_or_else(|| anyhow::anyhow!("icon doesn't decode"))?;
-        #[cfg(not(target_os = "linux"))]
-        return Ok(Self { _icon: build(png)? });
+        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+        let id = TrayIconId::new(format!("bitchord-{serial}"));
+        let toggle_id = format!("bitchord-window-{serial}");
+        let quit_id = format!("bitchord-quit-{serial}");
         #[cfg(target_os = "linux")]
-        {
-            gtk_thread::show(png)?;
-            Ok(Self {})
+        let toggle = Cmd::Hide;
+        #[cfg(not(target_os = "linux"))]
+        let toggle = Cmd::Show;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        #[cfg(target_os = "linux")]
+        let worker = linux::Worker::start(
+            icon,
+            id.clone(),
+            toggle_id.clone(),
+            quit_id.clone(),
+            wake.clone(),
+        )?;
+        #[cfg(not(target_os = "linux"))]
+        let (_icon, _) = build(icon, id.clone(), &toggle_id, &quit_id, toggle)?;
+
+        *EVENTS.lock().unwrap() = Some(Events {
+            id: id.clone(),
+            toggle_id,
+            quit_id,
+            toggle,
+            tx,
+            wake: Arc::new(wake),
+        });
+        Ok(Self {
+            id,
+            rx,
+            #[cfg(not(target_os = "linux"))]
+            _icon,
+            #[cfg(target_os = "linux")]
+            worker,
+        })
+    }
+
+    pub fn take(&self) -> impl Iterator<Item = Cmd> + '_ {
+        self.rx.try_iter().take(self.rx.len())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn available(&self) -> bool {
+        self.worker.available()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn set_menu_action(&self, cmd: Cmd) {
+        self.worker.set_toggle(cmd);
+    }
+}
+
+impl Drop for Tray {
+    fn drop(&mut self) {
+        let mut events = EVENTS.lock().unwrap();
+        if events.as_ref().is_some_and(|e| e.id == self.id) {
+            events.take();
         }
     }
 }
 
-#[cfg(target_os = "linux")]
-impl Drop for Tray {
-    fn drop(&mut self) {
-        gtk_thread::hide();
+impl Cmd {
+    fn label(self) -> &'static str {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Hide => "Hide",
+            #[cfg(target_os = "linux")]
+            Self::Show => "Show",
+            #[cfg(not(target_os = "linux"))]
+            Self::Show => "Show YT Music",
+            Self::Quit => "Quit",
+        }
     }
 }
 
-fn build(png: image::RgbaImage) -> anyhow::Result<TrayIcon> {
-    let menu = Menu::with_items(&[
-        &MenuItem::with_id("show", "Show YT Music", true, None),
-        &MenuItem::with_id("quit", "Quit", true, None),
-    ])?;
+fn build(
+    icon: &crate::appicon::Variant,
+    id: TrayIconId,
+    toggle_id: &str,
+    quit_id: &str,
+    toggle: Cmd,
+) -> anyhow::Result<(TrayIcon, MenuItem)> {
+    let png = icon
+        .rgba(32)
+        .ok_or_else(|| anyhow::anyhow!("icon doesn't decode"))?;
     let (w, h) = png.dimensions();
-    Ok(TrayIconBuilder::new()
+    let toggle = MenuItem::with_id(toggle_id, toggle.label(), true, None);
+    let quit = MenuItem::with_id(quit_id, Cmd::Quit.label(), true, None);
+    let menu = Menu::with_items(&[&toggle, &quit])?;
+    let builder = TrayIconBuilder::new()
+        .with_id(id)
         .with_icon(tray_icon::Icon::from_rgba(png.into_raw(), w, h)?)
-        .with_tooltip("YT Music")
         .with_menu(Box::new(menu))
-        .with_menu_on_left_click(false)
-        .build()?)
+        .with_menu_on_left_click(false);
+    #[cfg(target_os = "linux")]
+    let builder = builder.with_title("BitChord");
+    #[cfg(not(target_os = "linux"))]
+    let builder = builder.with_tooltip("YT Music");
+    Ok((builder.build()?, toggle))
 }
 
-#[cfg(target_os = "linux")]
-mod gtk_thread {
-    use std::cell::RefCell;
-    use std::sync::OnceLock;
-    use std::time::Duration;
-
-    use tray_icon::TrayIcon;
-
-    thread_local! {
-        static ICON: RefCell<Option<TrayIcon>> = const { RefCell::new(None) };
+fn dispatch(command: impl FnOnce(&Events) -> Option<Cmd>) {
+    let wake = EVENTS.lock().unwrap().as_ref().and_then(|events| {
+        let cmd = command(events)?;
+        events.tx.send(cmd).ok()?;
+        Some(events.wake.clone())
+    });
+    if let Some(wake) = wake {
+        wake();
     }
-
-    /// Start GTK's thread once; an error if GTK can't start (no display).
-    fn start() -> anyhow::Result<()> {
-        static STARTED: OnceLock<Result<(), String>> = OnceLock::new();
-        STARTED
-            .get_or_init(|| {
-                let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::Builder::new()
-                    .name("gtk".into())
-                    .spawn(move || match gtk::init() {
-                        Ok(()) => {
-                            let _ = tx.send(Ok(()));
-                            gtk::main();
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(e.to_string()));
-                        }
-                    })
-                    .map_err(|e| e.to_string())?;
-                rx.recv().map_err(|e| e.to_string())?
-            })
-            .clone()
-            .map_err(|e| anyhow::anyhow!("GTK: {e}"))
-    }
-
-    pub fn show(png: image::RgbaImage) -> anyhow::Result<()> {
-        start()?;
-        let (tx, rx) = std::sync::mpsc::channel();
-        gtk::glib::MainContext::default().invoke(move || {
-            let res = super::build(png).map(|icon| ICON.with(|i| *i.borrow_mut() = Some(icon)));
-            let _ = tx.send(res.map_err(|e| e.to_string()));
-        });
-        rx.recv_timeout(Duration::from_secs(5))?.map_err(|e| anyhow::anyhow!(e))
-    }
-
-    pub fn hide() {
-        gtk::glib::MainContext::default().invoke(|| ICON.with(|i| drop(i.borrow_mut().take())));
-    }
-}
-
-fn push(cmd: Cmd, wake: &impl Fn()) {
-    PENDING.lock().unwrap().push(cmd);
-    wake();
-}
-
-/// Clicks since the last call.
-pub fn take() -> Vec<Cmd> {
-    std::mem::take(&mut *PENDING.lock().unwrap())
 }

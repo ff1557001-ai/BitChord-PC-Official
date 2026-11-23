@@ -2,6 +2,7 @@
 
 mod appicon;
 mod apple;
+mod album_logo;
 mod artist_signature;
 mod fullscreen;
 mod grab;
@@ -10,6 +11,8 @@ mod renderer;
 mod art;
 mod audio;
 mod bitperfect;
+#[cfg(target_os = "linux")]
+mod child_process;
 mod backend;
 mod bestpart;
 mod bidi;
@@ -47,7 +50,9 @@ mod ytm;
 mod vault;
 mod ytmapi;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(not(target_os = "linux"))]
+use std::sync::OnceLock;
 
 use crossbeam_channel::unbounded;
 
@@ -77,13 +82,27 @@ fn main() -> eframe::Result {
     // A party link (`bitchord://party/CODE` or the https invite page): hand it to the running
     // instance if there is one, else join once this one is up. Before `init_logging`,
     // which would truncate the running instance's log file.
-    if let Some(link) = deeplink::from_args() {
-        if deeplink::forward_to_running(&link.url()) {
-            return Ok(());
-        }
-        deeplink::push(link);
-    } else if deeplink::forward_show() {
+    let link = deeplink::from_args();
+    #[cfg(target_os = "linux")]
+    let instance = match deeplink::Instance::open(
+        &data_dir(),
+        link.as_ref(),
+        std::env::args_os().any(|arg| arg == deeplink::RELAUNCH_FLAG),
+    )
+    .map_err(|err| eframe::Error::AppCreation(err.into()))?
+    {
+        Some(instance) => instance,
+        None => return Ok(()),
+    };
+    #[cfg(not(target_os = "linux"))]
+    if match &link {
+        Some(link) => deeplink::forward_to_running(&link.url()),
+        None => deeplink::forward_show(),
+    } {
         return Ok(());
+    }
+    if let Some(link) = link {
+        deeplink::push(link);
     }
     init_logging();
     guard_settings(&data_dir());
@@ -108,6 +127,17 @@ fn main() -> eframe::Result {
     let renderer = renderer::init(&data_dir());
     let options = eframe::NativeOptions {
         viewport,
+        #[cfg(target_os = "linux")]
+        event_loop_builder: if std::env::var_os("DISPLAY").is_some_and(|display| !display.is_empty())
+            && std::env::var_os("BITCHORD_NATIVE_WAYLAND").is_none()
+        {
+            Some(Box::new(|builder| {
+                use winit::platform::x11::EventLoopBuilderExtX11;
+                builder.with_x11();
+            }))
+        } else {
+            None
+        },
         renderer: match renderer {
             renderer::Renderer::OpenGl => eframe::Renderer::Glow,
             renderer::Renderer::Wgpu => eframe::Renderer::Wgpu,
@@ -126,98 +156,126 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
+    let create_app = |cc: &eframe::CreationContext<'_>| -> anyhow::Result<ui::App> {
+        #[cfg(target_os = "linux")]
+        let wake = tray::wayland::wake;
+        // Background threads wake the UI through this.
+        #[cfg(not(target_os = "linux"))]
+        static CTX: OnceLock<egui::Context> = OnceLock::new();
+        #[cfg(not(target_os = "linux"))]
+        let _ = CTX.set(cc.egui_ctx.clone());
+        #[cfg(not(target_os = "linux"))]
+        let wake = || {
+            if let Some(c) = CTX.get() {
+                c.request_repaint();
+            }
+        };
+
+        // Receive launch requests for this profile in the primary instance.
+        #[cfg(target_os = "linux")]
+        instance.listen(wake)?;
+        #[cfg(not(target_os = "linux"))]
+        deeplink::listen(wake);
+        // Keep `bitchord:` links pointing at this copy; dev builds leave it alone
+        // (even with YTM_UPDATE_FORCE).
+        if update::installed() && !cfg!(debug_assertions) {
+            deeplink::register_protocol();
+        }
+
+        let volume = cc
+            .storage
+            .and_then(|s| s.get_string("volume"))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.8f32);
+        // The slider is logarithmic unless turned off. A volume saved before that
+        // existed was linear: move it to where it sounds the same.
+        let log_setting = cc.storage.and_then(|s| s.get_string("log_volume"));
+        let log_volume = log_setting.as_deref().is_none_or(|v| v == "1");
+        let volume = if log_setting.is_none() {
+            volume.cbrt()
+        } else {
+            volume
+        };
+        // Dev hook: YTM_MUTE starts silent and never persists the volume.
+        let volume = if std::env::var_os("YTM_MUTE").is_some() {
+            0.0
+        } else {
+            volume
+        };
+
+        let device = cc
+            .storage
+            .and_then(|s| s.get_string("output_device"))
+            .filter(|d| !d.is_empty());
+
+        let (audio_tx, audio_rx) = unbounded();
+        let audio = audio::spawn(volume, log_volume, device, audio_tx, wake);
+
+        let data_dir = data_dir();
+        let (resp_tx, resp_rx) = unbounded();
+        let backend = backend::Backend::new(data_dir, resp_tx, audio.clone(), Arc::new(wake))?;
+
+        let (media_tx, media_rx) = unbounded();
+        if let Some(h) = hwnd(cc) {
+            appicon::set_hwnd(h);
+            fullscreen::set_hwnd(h);
+            grab::set_hwnd(h);
+            ui::set_titlebar_hwnd(h);
+            // eframe sets only the small icon; the taskbar button wants the big one.
+            appicon::set_window_icon(appicon::get(appicon::load(backend.data_dir())));
+        }
+        let media = media::Media::new(hwnd(cc), media_tx, wake);
+
+        // Which GL driver this is, for reports of drawing problems (Windows on ARM runs
+        // GL through Mesa's D3D12 layer).
+        if let Some(gl) = &cc.gl {
+            use eframe::glow::HasContext;
+            // SAFETY: plain string queries on the current context.
+            let (renderer, version) = unsafe {
+                (
+                    gl.get_parameter_string(eframe::glow::RENDERER),
+                    gl.get_parameter_string(eframe::glow::VERSION),
+                )
+            };
+            log::info!("gl: {renderer} ({version})");
+        }
+        if let Some(rs) = &cc.wgpu_render_state {
+            let info = rs.adapter.get_info();
+            log::info!(
+                "wgpu: {} ({:?}, driver {} {})",
+                info.name,
+                info.backend,
+                info.driver,
+                info.driver_info
+            );
+        }
+        let mut app = ui::App::new(
+            backend,
+            audio,
+            ui::Channels {
+                resp_rx,
+                audio_rx,
+                media_rx,
+            },
+            media,
+            cc.storage,
+        );
+        app.setup_window(cc);
+        Ok(app)
+    };
+    #[cfg(target_os = "linux")]
+    let run = tray::wayland::run(options, create_app);
+    #[cfg(not(target_os = "linux"))]
     let run = eframe::run_native(
         "BitChord",
         options,
-        Box::new(|cc| {
-            let ctx = cc.egui_ctx.clone();
-            theme::install_style(&ctx);
-            theme::install_fonts(&ctx, "inter");
-
-            // Background threads wake the UI through this; set once the context exists.
-            static CTX: OnceLock<egui::Context> = OnceLock::new();
-            let _ = CTX.set(ctx.clone());
-            let wake = || {
-                if let Some(c) = CTX.get() {
-                    c.request_repaint();
-                }
-            };
-
-            // Party links from later launches arrive over a pipe (first instance only).
-            deeplink::listen(wake);
-            // Keep `bitchord:` links pointing at this copy; dev builds leave it alone
-            // (even with YTM_UPDATE_FORCE).
-            if update::installed() && !cfg!(debug_assertions) {
-                deeplink::register_protocol();
-            }
-
-            let volume = cc
-                .storage
-                .and_then(|s| s.get_string("volume"))
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.8f32);
-            // The slider is logarithmic unless turned off. A volume saved before that
-            // existed was linear: move it to where it sounds the same.
-            let log_setting = cc.storage.and_then(|s| s.get_string("log_volume"));
-            let log_volume = log_setting.as_deref().is_none_or(|v| v == "1");
-            let volume = if log_setting.is_none() { volume.cbrt() } else { volume };
-            // Dev hook: YTM_MUTE starts silent and never persists the volume.
-            let volume = if std::env::var_os("YTM_MUTE").is_some() { 0.0 } else { volume };
-
-            let device = cc.storage.and_then(|s| s.get_string("output_device")).filter(|d| !d.is_empty());
-
-            let (audio_tx, audio_rx) = unbounded();
-            let audio = audio::spawn(volume, log_volume, device, audio_tx, wake);
-
-            let data_dir = data_dir();
-            let (resp_tx, resp_rx) = unbounded();
-            let backend = backend::Backend::new(data_dir, resp_tx, audio.clone(), Arc::new(wake))?;
-
-            egui_extras::install_image_loaders(&ctx);
-            ctx.add_bytes_loader(Arc::new(images::HttpImages::new(backend.clone())));
-
-            let (media_tx, media_rx) = unbounded();
-            if let Some(h) = hwnd(cc) {
-                appicon::set_hwnd(h);
-                fullscreen::set_hwnd(h);
-                grab::set_hwnd(h);
-                ui::set_titlebar_hwnd(h);
-                // eframe sets only the small icon; the taskbar button wants the big one.
-                appicon::set_window_icon(appicon::get(appicon::load(backend.data_dir())));
-            }
-            let media = media::Media::new(hwnd(cc), media_tx, wake);
-
-            // Which GL driver this is, for reports of drawing problems (Windows on ARM runs
-            // GL through Mesa's D3D12 layer).
-            if let Some(gl) = &cc.gl {
-                use eframe::glow::HasContext;
-                // SAFETY: plain string queries on the current context.
-                let (renderer, version) = unsafe { (gl.get_parameter_string(eframe::glow::RENDERER), gl.get_parameter_string(eframe::glow::VERSION)) };
-                log::info!("gl: {renderer} ({version})");
-            }
-            if let Some(rs) = &cc.wgpu_render_state {
-                let info = rs.adapter.get_info();
-                log::info!("wgpu: {} ({:?}, driver {} {})", info.name, info.backend, info.driver, info.driver_info);
-            }
-            // The animated background needs the GPU context; without it the UI falls back
-            // to a flat gradient.
-            let shader = std::env::var_os("YTM_NO_SHADER").is_none();
-            let bg = match (&cc.gl, &cc.wgpu_render_state) {
-                (Some(gl), _) if shader => shader::Background::new(gl).map_err(|e| log::warn!("background shader unavailable: {e:#}")).ok(),
-                (_, Some(rs)) if shader => Some(shader::Background::new_wgpu(rs)),
-                _ => None,
-            };
-
-            Ok(Box::new(ui::App::new(
-                backend,
-                audio,
-                ui::Channels { resp_rx, audio_rx, media_rx },
-                media,
-                bg,
-                cc.storage,
-            )))
-        }),
+        Box::new(|cc| Ok(Box::new(create_app(cc)?))),
     );
+    #[cfg(target_os = "linux")]
+    {
+        tray::finish();
+        child_process::HELPERS.finish();
+    }
     // A wgpu window that won't open would fail the same way at every launch: go back
     // to OpenGL for the next one.
     if run.is_err() && renderer == renderer::Renderer::Wgpu {
@@ -225,6 +283,30 @@ fn main() -> eframe::Result {
         let _ = renderer::save(&data_dir(), renderer::Renderer::OpenGl);
     }
     run
+}
+
+// Each renderer owns its own background resources.
+fn make_background(
+    cc: &eframe::CreationContext<'_>,
+    art: Option<&art::Art>,
+) -> Option<shader::Background> {
+    if std::env::var_os("YTM_NO_SHADER").is_some() {
+        return None;
+    }
+    let idle;
+    let art = if let Some(art) = art {
+        art
+    } else {
+        idle = art::idle();
+        &idle
+    };
+    match (&cc.gl, &cc.wgpu_render_state) {
+        (Some(gl), _) => shader::Background::new(gl, art)
+            .map_err(|err| log::warn!("background shader unavailable: {err:#}"))
+            .ok(),
+        (_, Some(rs)) => Some(shader::Background::new_wgpu(rs, art)),
+        _ => None,
+    }
 }
 
 #[cfg(windows)]

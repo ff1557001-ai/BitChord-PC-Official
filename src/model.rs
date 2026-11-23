@@ -226,6 +226,14 @@ pub fn sized(url: &str, px: u32) -> String {
         let crop = square_crop(&url[i + 1..]);
         return format!("{}=w{px}-h{px}{}-l90-rj", &url[..i], if crop { "-p" } else { "" });
     }
+    // High-res YouTube video cover upgrade (maxresdefault for desktop screens)
+    if px >= 240 && (url.contains("i.ytimg.com/vi/") || url.contains("img.youtube.com/vi/")) {
+        if url.ends_with("/hqdefault.jpg") || url.ends_with("/default.jpg") || url.ends_with("/mqdefault.jpg") || url.ends_with("/sddefault.jpg") {
+            if let Some((base, _)) = url.rsplit_once('/') {
+                return format!("{base}/maxresdefault.jpg");
+            }
+        }
+    }
     url.to_owned()
 }
 

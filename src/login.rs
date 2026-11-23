@@ -90,8 +90,15 @@ pub fn spawn(site: Site, profile_dir: PathBuf, done: impl FnOnce(Outcome) + Send
                 cmd.arg(site.flag())
                     .arg(&profile_dir)
                     .stdin(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .output()
+                    .stderr(std::process::Stdio::null());
+                #[cfg(target_os = "linux")]
+                {
+                    crate::child_process::HELPERS.output(&mut cmd, None)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    cmd.output()
+                }
             });
             done(match res {
                 Err(e) => Outcome::Failed(format!("could not start sign-in window: {e}")),

@@ -132,8 +132,14 @@ impl App {
     pub(super) fn tick_updates(&mut self, ctx: &egui::Context, now: f64) {
         use crate::update::{State, Updater};
         if self.updater.is_none() {
-            let c = ctx.clone();
-            self.updater = Some(Updater::new(self.backend.data_dir(), move || c.request_repaint()));
+            #[cfg(target_os = "linux")]
+            let wake = crate::tray::wayland::wake;
+            #[cfg(not(target_os = "linux"))]
+            let wake = {
+                let ctx = ctx.clone();
+                move || ctx.request_repaint()
+            };
+            self.updater = Some(Updater::new(self.backend.data_dir(), wake));
         }
         let Some(u) = self.updater.clone() else { return };
         let due = match self.update_checked {
@@ -169,47 +175,145 @@ impl App {
         self.quit(ctx);
     }
 
-    /// Close the app for real, even with "Close to tray" on.
+    /// Close the app for real, even when a normal window close hides it.
     pub(super) fn quit(&mut self, ctx: &egui::Context) {
-        self.exiting = true;
+        self.window.quit();
+        #[cfg(target_os = "linux")]
+        {
+            self.tray = None;
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
-    /// "Close to tray": × hides the window behind a tray icon; the icon brings it
-    /// back or quits. eframe keeps running `logic` while the window is hidden.
-    pub(super) fn tray_window(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested()) && self.close_to_tray && !self.exiting {
-            let c = ctx.clone();
-            match crate::tray::Tray::new(crate::appicon::get(self.app_icon), move || c.request_repaint()) {
-                Ok(t) => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                    self.tray = Some(t);
-                }
-                // Without an icon there'd be no way back: just close.
-                Err(e) => log::warn!("tray icon unavailable: {e:#}"),
-            }
-        }
-        if self.tray.is_none() {
-            return;
-        }
-        // The first click decides; the icon goes away with it.
-        match crate::tray::take().into_iter().next() {
-            Some(crate::tray::Cmd::Show) => self.show_window(ctx),
-            Some(crate::tray::Cmd::Quit) => {
-                self.tray = None;
-                self.quit(ctx);
-            }
-            None => {}
+    #[cfg(target_os = "linux")]
+    pub(crate) fn start_tray(&mut self, wake: impl Fn() + Send + Sync + Clone + 'static) {
+        match crate::tray::Tray::new(crate::appicon::get(self.app_icon), wake) {
+            Ok(tray) => self.tray = Some(tray),
+            Err(err) => log::warn!("tray icon unavailable: {err:#}"),
         }
     }
 
-    /// Bring the window back (from the tray, or minimized) and to the front.
+    pub(super) fn tray_window(&mut self, ctx: &egui::Context, reveal: bool) {
+        use crate::tray::Action;
+        use egui::ViewportCommand;
+
+        if self.window.exiting() {
+            return;
+        }
+        let (close, minimized) =
+            ctx.input(|i| (i.viewport().close_requested(), i.viewport().minimized));
+        #[cfg(not(target_os = "linux"))]
+        if close && self.close_to_tray && self.tray.is_none() {
+            let c = ctx.clone();
+            match crate::tray::Tray::new(crate::appicon::get(self.app_icon), move || {
+                c.request_repaint()
+            }) {
+                Ok(tray) => self.tray = Some(tray),
+                Err(err) => log::warn!("tray icon unavailable: {err:#}"),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let can_hide = self.tray.is_some();
+        // On Linux, close hides whenever there's a recoverable tray. The old
+        // preference is only used on the platforms with an on-demand tray.
+        #[cfg(target_os = "linux")]
+        let can_hide = self.tray.as_ref().is_some_and(crate::tray::Tray::available);
+
+        #[cfg(target_os = "linux")]
+        let previous_menu = self.window.menu_action();
+        let commands = self.tray.iter().flat_map(crate::tray::Tray::take);
+        let update_existing_window = |window: &mut crate::tray::Window, commands| {
+            let action = window.update(minimized, close, can_hide, reveal, commands);
+            (action, close && can_hide && action != Action::Quit)
+        };
+        #[cfg(target_os = "linux")]
+        let (action, cancel_close) = if self.native_wayland {
+            self.window
+                .update_wayland(close, can_hide, reveal, commands)
+        } else {
+            update_existing_window(&mut self.window, commands)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (action, cancel_close) = update_existing_window(&mut self.window, commands);
+        if cancel_close {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(until) = self.focus_after_show {
+            if matches!(action, Action::Hide | Action::Quit) {
+                self.focus_after_show = None;
+            } else if ctx.input(|i| i.time >= until) {
+                self.focus_after_show = None;
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            }
+        }
+        match action {
+            Action::None => {}
+            Action::Hide => {
+                #[cfg(target_os = "linux")]
+                if self.native_wayland {
+                    if !close {
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                    }
+                } else {
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                }
+                #[cfg(not(target_os = "linux"))]
+                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            }
+            Action::Show => self.show_window(ctx),
+            Action::Quit => {
+                #[cfg(not(target_os = "linux"))]
+                {
+                    self.tray = None;
+                }
+                self.quit(ctx);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let menu = self.window.menu_action();
+            if previous_menu != menu
+                && let Some(tray) = &self.tray
+            {
+                tray.set_menu_action(menu);
+            }
+            // X11 may update _NET_WM_STATE_HIDDEN without an egui event if
+            // the window was already unfocused when the user minimized it.
+            if !self.native_wayland
+                && can_hide
+                && !self.window.hidden()
+                && !ctx.input(|i| i.focused)
+            {
+                ctx.request_repaint_after(Duration::from_millis(750));
+            }
+        }
+    }
+
+    /// Request focus, restoring an existing window on platforms that support it.
     pub(super) fn show_window(&mut self, ctx: &egui::Context) {
-        self.tray = None;
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.tray = None;
+        }
+        #[cfg(target_os = "linux")]
+        if self.native_wayland {
+            // winit uses xdg-activation for attention when the compositor offers it.
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Informational,
+            ));
+            return;
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        #[cfg(target_os = "linux")]
+        {
+            // winit skips X11 focus requests until the window manager maps it.
+            let delay = Duration::from_millis(150);
+            self.focus_after_show = Some(ctx.input(|i| i.time) + delay.as_secs_f64());
+            ctx.request_repaint_after(delay);
+        }
     }
 
     /// Download the media controls' cover through our own client, into a file.

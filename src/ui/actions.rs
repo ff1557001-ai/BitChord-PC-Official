@@ -224,6 +224,14 @@ impl App {
                 let for_video = if self.playing_as().is_some_and(|s| s.id == track.id) { self.current_id().map(str::to_owned) } else { None };
                 self.backend.request(Req::Download { track, for_video });
             }
+            Action::DownloadBatch(tracks) => {
+                let count = tracks.len();
+                self.toast(format!("Queued {count} songs to download..."));
+                for track in tracks {
+                    let for_video = if self.playing_as().is_some_and(|s| s.id == track.id) { self.current_id().map(str::to_owned) } else { None };
+                    self.backend.request(Req::Download { track, for_video });
+                }
+            }
             Action::AddToPlaylist(tracks) => {
                 if self.logged_in { self.dialog = Some(Dialog::PickPlaylist(tracks)); }
                 else { self.toast("Sign in to edit playlists"); }

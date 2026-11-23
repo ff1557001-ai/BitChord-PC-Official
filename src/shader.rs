@@ -226,7 +226,7 @@ pub struct Background {
 }
 
 impl Background {
-    pub fn new_wgpu(rs: &eframe::egui_wgpu::RenderState) -> Self {
+    pub fn new_wgpu(rs: &eframe::egui_wgpu::RenderState, art: &Art) -> Self {
         let device = &rs.device;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("background"), source: wgpu::ShaderSource::Wgsl(WGSL.into()) });
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
@@ -307,16 +307,15 @@ impl Background {
                 ],
             })
         });
-        // Both slots start with the idle backdrop.
-        let idle = crate::art::idle();
+        // Seed both slots so a fresh renderer can draw the current art at any blend.
         for t in &tex {
-            upload_wgpu(&rs.queue, t, &idle);
+            upload_wgpu(&rs.queue, t, art);
         }
         rs.renderer.write().callback_resources.insert(Wgpu { pipeline, uniforms, tex, groups, cur: 0 });
         Self { gl: Default::default(), pending: Default::default(), wgpu: true }
     }
 
-    pub fn new(gl: &glow::Context) -> anyhow::Result<Self> {
+    pub fn new(gl: &glow::Context, art: &Art) -> anyhow::Result<Self> {
         let version = eframe::egui_glow::ShaderVersion::get(gl);
         let header = format!(
             "{}\n#define NEW_SHADER_INTERFACE {}\n{}\n",
@@ -366,10 +365,8 @@ impl Background {
                 pending: Default::default(),
                 wgpu: false,
             };
-            // Both slots start with the idle backdrop.
-            let idle = crate::art::idle();
             for t in tex {
-                upload(gl, t, &idle);
+                upload(gl, t, art);
             }
             Ok(this)
         }

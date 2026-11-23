@@ -503,6 +503,18 @@ impl Mini {
         Step::Settle(Some(size))
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn wayland_viewport(&self, builder: egui::ViewportBuilder) -> egui::ViewportBuilder {
+        if self.active() {
+            let h = height(self.lyrics);
+            builder
+                .with_min_inner_size([MIN_W, h])
+                .with_max_inner_size([MAX_W, h])
+        } else {
+            builder
+        }
+    }
+
     /// The window's size limits for a mode. Shrinking sets them first, so the full
     /// window's minimum doesn't hold the strip up. The strip's height is fixed at both
     /// and only the width runs.

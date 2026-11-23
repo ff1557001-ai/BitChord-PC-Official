@@ -943,6 +943,12 @@ pub fn soft_shadow(ui: &Ui, rect: Rect, radius: f32, blur: f32, alpha: f32) {
     ui.painter().add(s.as_shape(rect, CornerRadius::same(radius as u8)));
 }
 
+/// Colored ambient halo / drop shadow under artwork.
+pub fn ambient_shadow(ui: &Ui, rect: Rect, radius: f32, blur: f32, color: Color32) {
+    let s = egui::epaint::Shadow { offset: [0, (blur * 0.28) as i8], blur: blur as u8, spread: 2, color };
+    ui.painter().add(s.as_shape(rect, CornerRadius::same(radius as u8)));
+}
+
 /// What's playing, published by the app each frame so cards can show a pause button
 /// on the item that's playing.
 #[derive(Clone, Default)]

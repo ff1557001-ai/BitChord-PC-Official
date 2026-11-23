@@ -41,12 +41,14 @@ pub fn obtain(profile_dir: PathBuf) -> anyhow::Result<String> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     crate::proxy::pass_to(&mut cmd);
-    let out = cmd
-        .arg(FLAG)
+    cmd.arg(FLAG)
         .arg(&profile_dir)
         .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()?;
+        .stderr(std::process::Stdio::null());
+    #[cfg(target_os = "linux")]
+    let out = crate::child_process::HELPERS.output(&mut cmd, Some(GIVE_UP_AFTER + Duration::from_secs(15)))?;
+    #[cfg(not(target_os = "linux"))]
+    let out = cmd.output()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let line = text.lines().last().unwrap_or_default();
     if let Some(t) = line.strip_prefix("token ") {

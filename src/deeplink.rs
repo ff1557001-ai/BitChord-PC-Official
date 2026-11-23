@@ -3,7 +3,7 @@
 //! host and carries its own address in `?server=`).
 //!
 //! Clicking a link launches a new process with the URL as its argument. If another
-//! instance is already running, the new one hands the link over a named pipe and
+//! instance is already running, the new one hands the link over local IPC and
 //! exits; the running instance queues it here and wakes the UI, which drains the
 //! queue with `take()` (the same pattern as `tray.rs`).
 
@@ -19,7 +19,7 @@ pub struct Link {
 }
 
 impl Link {
-    /// The custom-scheme form, which is also what one instance sends another over the pipe.
+    /// The custom-scheme form also used for handoff between instances.
     pub fn url(&self) -> String {
         match &self.server {
             Some(s) => format!("bitchord://party/{}?server={}", self.code, encode(s)),
@@ -32,7 +32,6 @@ static PENDING: Mutex<Vec<Link>> = Mutex::new(Vec::new());
 /// A plain later launch asked for the window (see `forward_show`).
 static SHOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// What a plain later launch sends instead of a link.
-#[cfg_attr(not(windows), allow(dead_code))]
 const SHOW_MSG: &str = "show";
 /// The updater's relaunch passes this: the old copy may still be exiting, so don't hand over to it.
 pub const RELAUNCH_FLAG: &str = "--relaunch";
@@ -136,6 +135,7 @@ pub fn take_show() -> bool {
 /// one copy uses (and refreshes) the Google session. Two copies refreshing it apart
 /// leave one with old cookies, which Google treats as stolen and signs out. True if
 /// a running copy took it.
+#[cfg(not(target_os = "linux"))]
 pub fn forward_show() -> bool {
     if std::env::args_os().any(|a| a == RELAUNCH_FLAG) {
         return false;
@@ -152,7 +152,7 @@ pub fn forward_show() -> bool {
 
 /// Per-user pipe name. A dev profile (`YTM_DATA_DIR`) gets its own, so test runs
 /// never talk to the installed copy.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(windows)]
 fn pipe_name() -> String {
     let user: String = std::env::var("USERNAME")
         .unwrap_or_default()
@@ -172,16 +172,21 @@ fn pipe_name() -> String {
 #[cfg(windows)]
 pub use win::{forward_to_running, listen, register_protocol};
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn forward_to_running(_msg: &str) -> bool {
     false
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn listen(_wake: impl Fn() + Send + 'static) {}
 
 #[cfg(not(windows))]
 pub fn register_protocol() {}
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::Instance;
 
 #[cfg(windows)]
 mod win {
