@@ -4,11 +4,14 @@ mod appicon;
 mod apple;
 mod artist_signature;
 mod fullscreen;
+mod grab;
 mod proxy;
 mod renderer;
 mod art;
 mod audio;
+mod bitperfect;
 mod backend;
+mod bestpart;
 mod bidi;
 mod deeplink;
 mod discord;
@@ -27,6 +30,7 @@ mod model;
 mod motion;
 mod opus;
 mod preset;
+mod remux;
 mod shader;
 mod sponsorblock;
 mod stream;
@@ -82,6 +86,7 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     init_logging();
+    guard_settings(&data_dir());
     update::clean_portable();
     stream::init_dev_hooks();
     proxy::init(&data_dir());
@@ -175,6 +180,7 @@ fn main() -> eframe::Result {
             if let Some(h) = hwnd(cc) {
                 appicon::set_hwnd(h);
                 fullscreen::set_hwnd(h);
+                grab::set_hwnd(h);
                 ui::set_titlebar_hwnd(h);
                 // eframe sets only the small icon; the taskbar button wants the big one.
                 appicon::set_window_icon(appicon::get(appicon::load(backend.data_dir())));
@@ -233,6 +239,27 @@ fn hwnd(cc: &eframe::CreationContext) -> Option<*mut std::ffi::c_void> {
 #[cfg(not(windows))]
 fn hwnd(_: &eframe::CreationContext) -> Option<*mut std::ffi::c_void> {
     None
+}
+
+/// Keep the settings file from taking the app's every setting down with it. A copy
+/// killed mid-save (an update's installer, say) can leave `app.ron` half-written,
+/// which reads at the next launch as settings wiped. A good copy is backed up as it's
+/// seen; an unreadable one is set aside and the backup put in its place.
+pub(crate) fn guard_settings(dir: &std::path::Path) {
+    use std::io::BufReader;
+    let path = dir.join("app.ron");
+    let Ok(file) = std::fs::File::open(&path) else { return };
+    let reads = ron::de::from_reader::<_, std::collections::HashMap<String, String>>(BufReader::new(file)).is_ok();
+    if reads {
+        let _ = std::fs::copy(&path, dir.join("app.ron.bak"));
+        return;
+    }
+    log::warn!("settings: {} is unreadable; setting it aside", path.display());
+    let _ = std::fs::rename(&path, dir.join("app.ron.bad"));
+    let bak = dir.join("app.ron.bak");
+    if std::fs::copy(&bak, &path).is_ok() {
+        log::info!("settings: restored the last good copy");
+    }
 }
 
 /// Log to stderr in debug builds; release builds have no console, so log to a file

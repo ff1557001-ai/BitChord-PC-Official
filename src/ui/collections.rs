@@ -8,7 +8,7 @@ use crate::model::{ShelfKind, Target, Track};
 
 use super::lists::{Arrival, Done, LIKED_MUSIC, Opened, Start};
 use super::queue::QueueFill;
-use super::{App, shuffle};
+use super::App;
 
 impl App {
     /// Load an album or playlist, unless a load of it is under way. `changed`: if one is,
@@ -30,7 +30,7 @@ impl App {
         self.backend.request(match s.album {
             true => Req::Album { id: s.id, load: s.load },
             false => Req::Playlist { id: s.id, load: s.load, stream: s.stream },
-        });
+        })
     }
 
     pub(super) fn opened(&self, id: &str) -> Option<&Opened> {
@@ -61,6 +61,13 @@ impl App {
                 self.liked.remove(&t.id);
             }
         }
+        // Liked Music inserts and removes rows, so saved indices no longer identify the
+        // same songs. Progress from a previous batch can arrive while selecting again.
+        if self.selection.page.is_some() && !tracks.is_empty() && self.lists.get(LIKED_MUSIC).is_some_and(|o| {
+            tracks.iter().any(|t| o.c.tracks.iter().any(|row| row.id == t.id) != like)
+        }) {
+            self.selection.collection_changed(LIKED_MUSIC);
+        }
         self.lists.set_liked(tracks, like);
     }
 
@@ -68,13 +75,11 @@ impl App {
     /// as the rest arrives.
     pub(super) fn play_opened(&mut self, id: String, shuffled: bool) {
         let Some(o) = self.opened(&id).filter(|o| !o.c.tracks.is_empty()) else { return };
-        let mut tracks = o.c.tracks.clone();
-        if shuffled {
-            shuffle(&mut tracks);
-        }
-        let fill = self.receiving(&id).then(|| QueueFill { id: id.clone(), load: o.load, shuffled, ran_out: false });
+        let tracks = o.c.tracks.clone();
+        let fill = self.receiving(&id).then(|| QueueFill { id: id.clone(), load: o.load, ran_out: false });
         self.queue_source = Some(if o.c.is_album { Target::Album(id) } else { Target::Playlist(id) });
-        self.play_list_filling(tracks, 0, fill);
+        let start = if shuffled { super::shuffled_start(tracks.len()) } else { 0 };
+        self.play_list_filling(tracks, start, fill, Some(shuffled));
     }
 
     /// The album or playlist on screen.
@@ -90,6 +95,8 @@ impl App {
         let keep = self.keep_lists();
         let keep: Vec<&str> = keep.iter().map(String::as_str).collect();
         let Some(arrival) = self.lists.arrived(load, c, more, &keep) else { return };
+        // A newly loaded copy may reorder or replace rows, including duplicates.
+        self.selection.collection_changed(&id);
         if self.page_list() == Some(id.as_str()) {
             self.loading = false;
         }

@@ -6,6 +6,7 @@
 //!   (Apple-style TTML), BiniLyrics (TTML), Musixmatch (word-by-word and line LRC), LRCLib
 //!   (LRC and plain), Legato (KuGou LRC) and Portato (QQ QRC).
 //! - Unison, the community lyrics service, answers a plain GET.
+//! - lrc.red provides TTML; Genius provides unsynced lyrics from its public website.
 //!
 //! The API needs a JWT, obtained by exchanging a Cloudflare Turnstile token (see
 //! turnstile.rs). JWTs last 24 h and are cached on disk.
@@ -19,12 +20,15 @@ use serde_json::Value;
 const API: &str = "https://lyrics.api.dacubeking.com/";
 const UNISON_API: &str = "https://unison.betterlyrics.org/lyrics";
 const LRCRED_API: &str = "https://lrc.red/";
+const GENIUS_SEARCH: &str = "https://genius.com/api/search/multi";
+// A non-browser UA avoids claiming browser TLS/client-hint fingerprints.
+const GENIUS_UA: &str = "BitChord";
 
 /// lrc.red's free API asks callers to identify themselves with a link.
 const LRCRED_UA: &str = concat!("BitChord/", env!("CARGO_PKG_VERSION"), " (+https://github.com/jackychan4891/BitChord-PC-Continued)");
 
-/// One source of lyrics, in the extension's default priority order (its
-/// `PROVIDER_CONFIGS`, without the two YouTube sources).
+/// One source of lyrics, in default priority order (the extension's
+/// `PROVIDER_CONFIGS`, without YouTube, plus additional providers).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Provider {
     BLyricsRich,
@@ -43,6 +47,7 @@ pub enum Provider {
     LrcredSynced,
     UnisonPlain,
     LrclibPlain,
+    GeniusPlain,
 }
 
 /// How finely a provider's lyrics are timed.
@@ -55,7 +60,7 @@ pub enum SyncKind {
 }
 
 impl Provider {
-    pub const ALL: [Provider; 16] = [
+    pub const ALL: [Provider; 17] = [
         Provider::BLyricsRich,
         Provider::UnisonRich,
         Provider::BinimumRich,
@@ -72,6 +77,7 @@ impl Provider {
         Provider::LrcredSynced,
         Provider::UnisonPlain,
         Provider::LrclibPlain,
+        Provider::GeniusPlain,
     ];
 
     /// The extension's key for it (also how the order is stored).
@@ -93,6 +99,7 @@ impl Provider {
             Provider::LrcredSynced => "lrcred-synced",
             Provider::UnisonPlain => "unison-plain",
             Provider::LrclibPlain => "lrclib-plain",
+            Provider::GeniusPlain => "genius-plain",
         }
     }
 
@@ -110,6 +117,7 @@ impl Provider {
             Provider::LrclibSynced | Provider::LrclibPlain => "LRCLib",
             Provider::LrcredRich | Provider::LrcredSynced => "lrc.red",
             Provider::LegatoSynced => "Better Lyrics Legato",
+            Provider::GeniusPlain => "Genius",
         }
     }
 
@@ -124,7 +132,7 @@ impl Provider {
             | Provider::LegatoSynced
             | Provider::MusixmatchSynced
             | Provider::LrcredSynced => SyncKind::Line,
-            Provider::UnisonPlain | Provider::LrclibPlain => SyncKind::Unsynced,
+            Provider::UnisonPlain | Provider::LrclibPlain | Provider::GeniusPlain => SyncKind::Unsynced,
         }
     }
 }
@@ -218,18 +226,72 @@ impl LyricsSet {
 
 pub struct Client {
     http: reqwest::Client,
+    /// Separate redirect policy for untrusted Genius search results.
+    genius_about_http: tokio::sync::OnceCell<reqwest::Client>,
     jwt_file: PathBuf,
     webview_profile: PathBuf,
     jwt: tokio::sync::Mutex<Option<String>>,
     /// When the Turnstile challenge last failed; it isn't retried for a while, so
     /// every new song doesn't start another WebView2.
     challenge_failed: std::sync::Mutex<Option<std::time::Instant>>,
-    /// The last few songs' lyrics, for replays and going back.
-    recent: std::sync::Mutex<std::collections::VecDeque<(String, LyricsSet)>>,
+    /// Final results and the newest request for each song still being fetched.
+    recent: std::sync::Arc<std::sync::Mutex<RecentLyrics>>,
 }
 
 const CHALLENGE_RETRY: Duration = Duration::from_secs(15 * 60);
 const RECENT: usize = 8;
+
+#[derive(Default)]
+struct RecentLyrics {
+    entries: std::collections::VecDeque<(String, bool, LyricsSet)>,
+    // Keep the newest generation until every overlapping request has finished, even if
+    // its result was empty or was evicted while an older request was still running.
+    pending: HashMap<String, (u64, usize)>,
+}
+
+/// Registered when the request is issued, before it waits for the stream duration.
+pub struct FetchTicket {
+    recent: std::sync::Arc<std::sync::Mutex<RecentLyrics>>,
+    video_id: String,
+    generation: u64,
+}
+
+impl FetchTicket {
+    fn is_current(&self) -> bool {
+        self.recent.lock().unwrap().pending.get(&self.video_id).is_some_and(|(newest, _)| *newest == self.generation)
+    }
+
+    fn cached(&self, genius_enabled: bool) -> Option<LyricsSet> {
+        self.recent.lock().unwrap().entries.iter().find(|(id, enabled, _)| id == &self.video_id && *enabled == genius_enabled).map(|(_, _, set)| set.clone())
+    }
+
+    fn cache_final(&self, genius_enabled: bool, set: &LyricsSet) {
+        if set.sources.is_empty() {
+            return;
+        }
+        let mut recent = self.recent.lock().unwrap();
+        if !recent.pending.get(&self.video_id).is_some_and(|(newest, _)| *newest == self.generation) {
+            return;
+        }
+        recent.entries.retain(|(id, _, _)| id != &self.video_id);
+        while recent.entries.len() >= RECENT {
+            recent.entries.pop_front();
+        }
+        recent.entries.push_back((self.video_id.clone(), genius_enabled, set.clone()));
+    }
+}
+
+impl Drop for FetchTicket {
+    fn drop(&mut self) {
+        let mut recent = self.recent.lock().unwrap();
+        if let Some((_, count)) = recent.pending.get_mut(&self.video_id) {
+            *count -= 1;
+            if *count == 0 {
+                recent.pending.remove(&self.video_id);
+            }
+        }
+    }
+}
 
 pub struct Query<'a> {
     pub video_id: &'a str,
@@ -245,6 +307,7 @@ impl Client {
         let cached = std::fs::read_to_string(&jwt_file).ok().filter(|t| jwt_seconds_left(t) > 3600);
         Self {
             http,
+            genius_about_http: tokio::sync::OnceCell::new(),
             jwt_file,
             webview_profile: data_dir.join("webview-lyrics"),
             jwt: tokio::sync::Mutex::new(cached),
@@ -253,35 +316,26 @@ impl Client {
         }
     }
 
-    /// Every source's lyrics for a song: the Better Lyrics stream, Unison and lrc.red, together.
-    pub async fn fetch(&self, q: &Query<'_>) -> anyhow::Result<LyricsSet> {
-        if let Some((_, l)) = self.recent.lock().unwrap().iter().find(|(id, _)| id == q.video_id) {
-            return Ok(l.clone());
-        }
-        let (stream, unison, lrcred) = tokio::join!(self.fetch_stream(q), self.fetch_unison(q), self.fetch_lrcred(q));
-        let mut sources = Vec::new();
-        match stream {
-            Ok(s) => sources.extend(s),
-            Err(e) => log::warn!("better lyrics failed: {e:#}"),
-        }
-        match unison {
-            Ok(s) => sources.extend(s),
-            Err(e) => log::info!("unison: {e:#}"),
-        }
-        match lrcred {
-            Ok(s) => sources.extend(s),
-            Err(e) => log::info!("lrc.red: {e:#}"),
-        }
-        if sources.is_empty() {
-            return Ok(LyricsSet::default());
-        }
-        sources.sort_by_key(|l| Provider::ALL.iter().position(|p| *p == l.provider));
-        let set = LyricsSet { sources };
+    /// Register synchronously so a request waiting for duration still supersedes older ones.
+    pub fn begin_fetch(&self, video_id: &str, generation: u64) -> FetchTicket {
         let mut recent = self.recent.lock().unwrap();
-        if recent.len() == RECENT {
-            recent.pop_front();
+        let pending = recent.pending.entry(video_id.to_owned()).or_insert((generation, 0));
+        pending.0 = pending.0.max(generation);
+        pending.1 += 1;
+        FetchTicket { recent: self.recent.clone(), video_id: video_id.to_owned(), generation }
+    }
+
+    pub async fn fetch(&self, q: &Query<'_>, ticket: &FetchTicket, genius_enabled: bool, partial: impl FnMut(LyricsSet) + Send) -> anyhow::Result<LyricsSet> {
+        if let Some(set) = ticket.cached(genius_enabled) {
+            return Ok(set);
         }
-        recent.push_back((q.video_id.to_owned(), set.clone()));
+        let genius = async {
+            if genius_enabled && ticket.is_current() { self.fetch_genius(q).await } else { Ok(Vec::new()) }
+        };
+        let (set, genius_ok) = gather_lyrics(self.fetch_stream(q), self.fetch_unison(q), self.fetch_lrcred(q), genius, partial).await;
+        if genius_ok {
+            ticket.cache_final(genius_enabled, &set);
+        }
         Ok(set)
     }
 
@@ -377,6 +431,84 @@ impl Client {
         Ok(Lyrics::new(p, t.lines, t.language, t.songwriters).into_iter().collect())
     }
 
+    /// Anonymous Genius search and page scrape. Bound the whole fallback, including retries.
+    ///
+    /// The cause travels with the error, because "it failed" and "the site answered 403"
+    /// are different problems to fix; the URL that would have said more is off it already.
+    async fn fetch_genius(&self, q: &Query<'_>) -> anyhow::Result<Vec<Lyrics>> {
+        tokio::time::timeout(Duration::from_secs(12), self.fetch_genius_inner(q)).await
+            .map_err(|_| anyhow::anyhow!("Genius lyrics lookup timed out"))?
+    }
+
+    async fn fetch_genius_inner(&self, q: &Query<'_>) -> anyhow::Result<Vec<Lyrics>> {
+        for attempt in genius_search_attempts(q.song, q.artist) {
+            let Some(body) = self.genius_page(&attempt).await? else { continue };
+            let lines = parse_genius_html(&String::from_utf8_lossy(&body));
+            return Ok(Lyrics::new(Provider::GeniusPlain, lines, None, vec![]).into_iter().collect());
+        }
+        Ok(vec![])
+    }
+
+    /// Genius's description of the song, not its lyrics or a line annotation.
+    /// `Ok(None)` means no suitable match or description; errors carry the site's answer but
+    /// never a URL. This runs only when explicitly requested and does not use a JWT.
+    pub async fn genius_about(&self, q: &Query<'_>) -> anyhow::Result<Option<String>> {
+        if q.song.trim().is_empty() || q.artist.trim().is_empty() {
+            return Ok(None);
+        }
+        tokio::time::timeout(Duration::from_secs(12), self.genius_about_inner(q)).await
+            .map_err(|_| anyhow::anyhow!("Genius about lookup timed out"))?
+    }
+
+    async fn genius_about_inner(&self, q: &Query<'_>) -> anyhow::Result<Option<String>> {
+        // The shared matcher also supports title-only lyric searches. About must never
+        // accept one after cleaning away the artist's entire name.
+        let attempts = genius_search_attempts(q.song, q.artist).into_iter()
+            .filter(|attempt| !genius_fold(&attempt.artist).is_empty() && !genius_fold(&attempt.title).is_empty());
+        for attempt in attempts {
+            let Some(body) = self.genius_page(&attempt).await? else { continue };
+            return Ok(parse_genius_about(&String::from_utf8_lossy(&body)));
+        }
+        Ok(None)
+    }
+
+    /// Both Genius lookups use the proxy-aware client with restricted redirects and bodies.
+    ///
+    /// The app's one client that isn't the system's TLS: Genius's bot filter scores the
+    /// handshake before it looks at the headers, and the Windows stack's signature reads as
+    /// a non-browser wearing a costume — rustls's is let through. What a request would have
+    /// named in the log (the song, in the search's query) comes off the error first.
+    async fn genius_page(&self, attempt: &GeniusAttempt) -> anyhow::Result<Option<Vec<u8>>> {
+        let http = self.genius_about_http.get_or_try_init(|| async {
+            crate::proxy::apply(reqwest::Client::builder())
+                .use_rustls_tls()
+                .redirect(genius_redirect_policy())
+                .connect_timeout(Duration::from_secs(8))
+                .build()
+                .map_err(|_| anyhow::anyhow!("Genius HTTP client setup failed"))
+        }).await?;
+        let response = http.get(GENIUS_SEARCH)
+            .query(&[("q", &attempt.query)])
+            .header(reqwest::header::USER_AGENT, GENIUS_UA)
+            .header(reqwest::header::ACCEPT, "application/json, text/html;q=0.9, */*;q=0.8")
+            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+            .timeout(Duration::from_secs(8))
+            .send().await.map_err(|e| anyhow::anyhow!("Genius search request failed: {}", reqwest::Error::without_url(e)))?;
+        let body = genius_bounded_body(response, 1024 * 1024).await.map_err(|e| anyhow::anyhow!("Genius search response failed: {e:#}"))?;
+        let hits: Value = serde_json::from_slice(&body).map_err(|_| anyhow::anyhow!("invalid Genius search response"))?;
+        let Some(url) = best_genius_url(&hits, &attempt.title, &attempt.artist) else { return Ok(None) };
+        // A song page is identified by its path, not untrusted query parameters.
+        let url = genius_page_url(&url)?;
+        let response = http.get(url)
+            .header(reqwest::header::USER_AGENT, GENIUS_UA)
+            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+            .timeout(Duration::from_secs(8))
+            .send().await.map_err(|e| anyhow::anyhow!("Genius page request failed: {}", reqwest::Error::without_url(e)))?;
+        let body = genius_bounded_body(response, 4 * 1024 * 1024).await.map_err(|e| anyhow::anyhow!("Genius page response failed: {e:#}"))?;
+        Ok(Some(body))
+    }
+
     /// A valid JWT, from cache or by running the Turnstile challenge.
     async fn token(&self, force_new: bool) -> anyhow::Result<String> {
         let mut slot = self.jwt.lock().await;
@@ -410,6 +542,44 @@ impl Client {
         *slot = Some(jwt.clone());
         Ok(jwt)
     }
+}
+
+async fn gather_lyrics<S, U, L, G>(stream: S, unison: U, lrcred: L, genius: G, mut partial: impl FnMut(LyricsSet)) -> (LyricsSet, bool)
+where
+    S: Future<Output = anyhow::Result<Vec<Lyrics>>>,
+    U: Future<Output = anyhow::Result<Vec<Lyrics>>>,
+    L: Future<Output = anyhow::Result<Vec<Lyrics>>>,
+    G: Future<Output = anyhow::Result<Vec<Lyrics>>>,
+{
+    tokio::pin!(stream, unison, lrcred, genius);
+    let (mut stream_done, mut unison_done, mut lrcred_done, mut genius_done) = (false, false, false, false);
+    let (mut completed, mut genius_ok) = (0, true);
+    let mut sources = Vec::new();
+    while completed < 4 {
+        let (provider, result) = tokio::select! {
+            result = &mut stream, if !stream_done => { stream_done = true; ("better lyrics", result) },
+            result = &mut unison, if !unison_done => { unison_done = true; ("unison", result) },
+            result = &mut lrcred, if !lrcred_done => { lrcred_done = true; ("lrc.red", result) },
+            result = &mut genius, if !genius_done => { genius_done = true; ("genius", result) },
+        };
+        completed += 1;
+        match result {
+            Ok(found) if !found.is_empty() => {
+                sources.extend(found);
+                sources.sort_by_key(|l| Provider::ALL.iter().position(|p| *p == l.provider));
+                if completed < 4 {
+                    partial(LyricsSet { sources: sources.clone() });
+                }
+            }
+            Ok(_) => {}
+            Err(e) if provider == "genius" => {
+                genius_ok = false;
+                log::info!("genius: {e:#}");
+            }
+            Err(e) => log::info!("{provider}: {e:#}"),
+        }
+    }
+    (LyricsSet { sources }, genius_ok)
 }
 
 fn jwt_seconds_left(jwt: &str) -> i64 {
@@ -580,6 +750,220 @@ fn fold_title(s: &str) -> String {
     let s = s.split(" [").next().unwrap_or(s);
     let s = s.split(" - ").next().unwrap_or(s);
     fold(s)
+}
+
+// ------------------------------------------------------------------- Genius
+
+struct GeniusAttempt {
+    query: String,
+    title: String,
+    artist: String,
+}
+
+/// Remove common video/credit decorations without discarding meaningful song titles.
+fn genius_clean_query(text: &str) -> String {
+    let text = text.split(" | ").next().unwrap_or(text);
+    let mut cleaned = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if matches!(c, '(' | '[') {
+            let close = if c == '(' { ')' } else { ']' };
+            let mut bracket = String::new();
+            let mut found = false;
+            for ch in chars.by_ref() {
+                if ch == close {
+                    found = true;
+                    break;
+                }
+                bracket.push(ch);
+            }
+            let lower = bracket.trim().to_lowercase();
+            let noise = ["from ", "feat", "ft.", "ft ", "featuring", "with ", "prod", "official", "lyrical", "video", "audio", "music video", "visualizer", "mv", "hd", "4k", "hq", "full song", "remaster"];
+            if !found || !noise.iter().any(|n| lower.starts_with(n)) {
+                cleaned.push(c);
+                cleaned.push_str(&bracket);
+                if found {
+                    cleaned.push(close);
+                }
+            } else {
+                cleaned.push(' ');
+            }
+        } else if matches!(c, '♪' | '♫' | '★' | '☆' | '【' | '】' | '《' | '》' | '「' | '」' | '~' | '_') {
+            cleaned.push(' ');
+        } else {
+            cleaned.push(c);
+        }
+    }
+    // These are decorations rather than title qualifiers, so remove them even unbracketed.
+    // ASCII-only case folding keeps byte offsets valid in the original Unicode string.
+    let lower = cleaned.to_ascii_lowercase();
+    let end = [" official music video", " official video", " official audio", " music video", " lyrical video", " full song", " prod.", " produced by "]
+        .iter()
+        .filter_map(|n| lower.find(n))
+        .min()
+        .unwrap_or(cleaned.len());
+    cleaned[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn genius_without_brackets(text: &str) -> String {
+    let mut out = String::new();
+    let mut inside = false;
+    for c in text.chars() {
+        match c {
+            '(' | '[' => { inside = true; out.push(' '); }
+            ')' | ']' if inside => inside = false,
+            _ if !inside => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn genius_search_attempts(song: &str, artist: &str) -> Vec<GeniusAttempt> {
+    let clean_title = genius_clean_query(song);
+    let clean_artist = genius_clean_query(artist);
+    if clean_title.is_empty() {
+        return vec![];
+    }
+    let mut title = clean_title.as_str();
+    let mut artist = clean_artist.as_str();
+    if let Some((left, right)) = [" - ", " – ", " — ", ": ", "–", "—"].iter().find_map(|sep| clean_title.split_once(*sep)) {
+        if !artist.is_empty() && genius_fold(left) == genius_fold(artist) {
+            title = right.trim();
+        } else if !artist.is_empty() && genius_fold(right) == genius_fold(artist) {
+            title = left.trim();
+        } else if artist.is_empty() && !left.trim().is_empty() && !right.trim().is_empty() {
+            artist = left.trim();
+            title = right.trim();
+        }
+    }
+    let mut attempts = Vec::new();
+    let mut add = |query: String, title: &str, artist: &str| {
+        let query = query.trim().to_owned();
+        if !query.is_empty() && !title.trim().is_empty() && !attempts.iter().any(|a: &GeniusAttempt| a.query == query) {
+            attempts.push(GeniusAttempt { query, title: title.to_owned(), artist: artist.to_owned() });
+        }
+    };
+    add(format!("{artist} {title}"), title, artist);
+    let unbracketed = genius_without_brackets(title);
+    if unbracketed != title && !unbracketed.is_empty() {
+        // Keep the original title for matching; the shorter form is only a search hint.
+        add(format!("{artist} {unbracketed}"), title, artist);
+    }
+    if clean_title != title {
+        add(format!("{clean_artist} {clean_title}"), &clean_title, &clean_artist);
+    }
+    add(unbracketed, title, artist);
+    attempts
+}
+
+/// Unicode-aware, punctuation-insensitive comparison, with words kept separate.
+fn genius_fold(s: &str) -> String {
+    let mut folded = String::new();
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            folded.extend(c.to_lowercase());
+        } else {
+            folded.push(' ');
+        }
+    }
+    folded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn genius_phrase_contains(haystack: &str, needle: &str) -> bool {
+    !needle.is_empty() && format!(" {haystack} ").contains(&format!(" {needle} "))
+}
+
+/// Limit both the initial page and redirects to Genius over standard HTTPS.
+fn safe_genius_url(url: &url::Url) -> bool {
+    url.scheme() == "https" && matches!(url.host_str(), Some("genius.com" | "www.genius.com"))
+        && url.port_or_known_default() == Some(443) && url.username().is_empty() && url.password().is_none()
+}
+
+fn genius_page_url(raw: &str) -> anyhow::Result<url::Url> {
+    let mut url = url::Url::parse(raw).map_err(|_| anyhow::anyhow!("invalid Genius page URL"))?;
+    anyhow::ensure!(safe_genius_url(&url), "unsafe Genius page URL");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn genius_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() < 5 && safe_genius_url(attempt.url()) {
+            attempt.follow()
+        } else {
+            // A redirect error can nest the previous URL, including the search query.
+            attempt.stop()
+        }
+    })
+}
+
+/// Reject oversized responses, including chunked or compressed bodies with no useful length.
+async fn genius_bounded_body(response: reqwest::Response, limit: usize) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(!response.status().is_redirection(), "Genius redirect refused: {}", response.status());
+    let mut response = response.error_for_status().map_err(reqwest::Error::without_url)?;
+    anyhow::ensure!(response.content_length().is_none_or(|n| n <= limit as u64), "Genius response exceeds {limit} bytes");
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(reqwest::Error::without_url)? {
+        anyhow::ensure!(chunk.len() <= limit.saturating_sub(body.len()), "Genius response exceeds {limit} bytes");
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Match both title and known artist; never fall back to an unrelated search hit.
+fn best_genius_url(response: &Value, title: &str, artist: &str) -> Option<String> {
+    let target_title = genius_fold(&genius_clean_query(title));
+    let target_artist = genius_fold(artist);
+    if target_title.is_empty() {
+        return None;
+    }
+    let mut best: Option<(i32, String)> = None;
+    for section in response["response"]["sections"].as_array().into_iter().flatten().filter(|s| s["type"] == "song") {
+        for hit in section["hits"].as_array().into_iter().flatten() {
+            let item = &hit["result"];
+            let hit_title = genius_fold(&genius_clean_query(item["title"].as_str().unwrap_or_default()));
+            let hit_artist = genius_fold(item["artist_names"].as_str().filter(|s| !s.trim().is_empty()).or_else(|| item["primary_artist"]["name"].as_str()).unwrap_or_default());
+            if hit_title.is_empty() || (!target_artist.is_empty() && hit_artist.is_empty()) {
+                continue;
+            }
+            let exact_title = hit_title == target_title;
+            let shorter = hit_title.chars().count().min(target_title.chars().count());
+            let longer = hit_title.chars().count().max(target_title.chars().count());
+            let close_title = shorter >= 4 && shorter * 4 >= longer * 3
+                && (genius_phrase_contains(&hit_title, &target_title) || genius_phrase_contains(&target_title, &hit_title));
+            if !exact_title && !close_title {
+                continue;
+            }
+            let exact_artist = hit_artist == target_artist;
+            let hit_contains_artist = genius_phrase_contains(&hit_artist, &target_artist);
+            // Don't let a generic fragment like "The" match "The Beatles".
+            let artist_contains_hit = hit_artist.chars().count() >= 4
+                && hit_artist.chars().count() * 2 >= target_artist.chars().count()
+                && genius_phrase_contains(&target_artist, &hit_artist);
+            if !target_artist.is_empty() && !exact_artist && !hit_contains_artist && !artist_contains_hit {
+                continue;
+            }
+            let Some(url) = item["url"].as_str().and_then(|u| url::Url::parse(u).ok()) else { continue };
+            if !safe_genius_url(&url) {
+                continue;
+            }
+            let path = format!("{} {}", item["path"].as_str().unwrap_or_default(), url.path()).to_lowercase();
+            let target = title.to_lowercase();
+            if [("translation", "translation"), ("türkçe", "türkçe"), ("turkce", "turkce"), ("polskie-tlumaczenie", "polskie"),
+                ("tracklist", "tracklist"), ("album-art", "album art"), ("instrumental", "instrumental"), ("-review", "review")]
+                .iter().any(|(noise, wanted)| path.contains(noise) && !target.contains(wanted))
+            {
+                continue;
+            }
+            let score = (if exact_title { 50 } else { 25 }) + (if target_artist.is_empty() { 0 } else if exact_artist { 40 } else { 20 });
+            if best.as_ref().is_none_or(|(s, _)| score > *s) {
+                best = Some((score, url.into()));
+            }
+        }
+    }
+    best.map(|(_, url)| url)
 }
 
 // ------------------------------------------------------------------- shared helpers
@@ -959,6 +1343,176 @@ fn lrc_songwriters(text: &str) -> Vec<String> {
 
 pub fn parse_plain(text: &str) -> Vec<Line> {
     text.split('\n').map(|s| Line { text: s.to_owned(), ..Default::default() }).collect()
+}
+
+/// Extract only Genius lyric containers, preserving explicit line and paragraph breaks.
+fn parse_genius_html(html: &str) -> Vec<Line> {
+    let doc = dom_query::Document::from(html);
+    let modern = doc.select("div[data-lyrics-container='true']");
+    let containers = if modern.is_empty() { doc.select("div.lyrics") } else { modern };
+    // Selection and this traversal are both in document order. Track nesting in one
+    // pass rather than searching every selected node's ancestors and all matches.
+    let mut selected = containers.nodes().iter().peekable();
+    let mut scan = vec![(doc.root(), false)];
+    let mut raw = String::new();
+    while let Some((container, nested)) = scan.pop() {
+        let matched = selected.peek().is_some_and(|c| c.id == container.id);
+        if matched {
+            selected.next();
+        }
+        scan.extend(container.children_it(true).map(|child| (child, nested || matched)));
+        if !matched || nested {
+            continue;
+        }
+        if !raw.is_empty() && !raw.ends_with('\n') {
+            raw.push('\n');
+        }
+        let mut stack = vec![(container, false)];
+        while let Some((node, closing)) = stack.pop() {
+            if closing {
+                if !raw.is_empty() && !raw.ends_with('\n') {
+                    raw.push('\n');
+                }
+                continue;
+            }
+            if node.is_text() {
+                raw.push_str(&node.text());
+                continue;
+            }
+            let name = node.node_name();
+            let name = name.as_deref().unwrap_or_default();
+            let excluded_class = node.class().is_some_and(|classes| classes.split_ascii_whitespace().any(|c| {
+                ["LyricsHeader__Container", "SongBioPreview__Container", "InreadAd__Container"].iter().any(|prefix| c.starts_with(prefix))
+            }));
+            if matches!(name, "script" | "style" | "button" | "noscript") || excluded_class
+                || node.attr("data-exclude-from-selection").is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            {
+                continue;
+            }
+            if name == "br" {
+                raw.push('\n');
+            } else {
+                if name == "p" {
+                    if !raw.is_empty() && !raw.ends_with('\n') {
+                        raw.push('\n');
+                    }
+                    stack.push((node, true));
+                }
+                stack.extend(node.children_it(true).map(|child| (child, false)));
+            }
+        }
+    }
+    const MARKER: &[u8] = b"you might also like";
+    let mut cleaned = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        cleaned.push(match ch {
+            '\u{00a0}' | '\u{200b}' | '\u{feff}' => ' ',
+            _ => ch,
+        });
+        // The marker cannot overlap itself (its only 'y' is the first byte).
+        // Removing a suffix as it arrives also handles markers formed by a removal.
+        if cleaned.len() >= MARKER.len() && cleaned.as_bytes()[cleaned.len() - MARKER.len()..].eq_ignore_ascii_case(MARKER) {
+            let mut start = cleaned.len() - MARKER.len();
+            while start > 0 && cleaned.as_bytes()[start - 1].is_ascii_digit() {
+                start -= 1;
+            }
+            cleaned.truncate(start);
+        }
+    }
+    let mut lines = Vec::new();
+    for line in cleaned.lines() {
+        let mut line = line.trim();
+        if line.to_ascii_lowercase().ends_with("embed") {
+            let mut end = line.len() - "embed".len();
+            while end > 0 && line.as_bytes()[end - 1].is_ascii_digit() {
+                end -= 1;
+            }
+            line = line[..end].trim_end();
+        }
+        if line.is_empty() {
+            if !lines.is_empty() && !lines.last().is_some_and(|s: &String| s.is_empty()) {
+                lines.push(String::new());
+            }
+        } else {
+            lines.push(line.to_owned());
+        }
+    }
+    if lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    if lines.is_empty() { vec![] } else { parse_plain(&lines.join("\n")) }
+}
+
+/// Only description/bio containers are eligible; a lyrics container is never a fallback.
+fn parse_genius_about(html: &str) -> Option<String> {
+    const MAX_CHARS: usize = 900;
+    let doc = dom_query::Document::from(html);
+    let selections = [
+        doc.select("div[data-testid='song-description']"),
+        doc.select("[class*='SongBioPreview-desktop__Container'], [class*='SongBioPreview__Container']"),
+    ];
+    for selection in selections {
+        for container in selection.nodes() {
+            let mut paragraphs = Vec::new();
+            let mut current = String::new();
+            let mut stack = vec![(*container, false)];
+            while let Some((node, closing)) = stack.pop() {
+                if closing {
+                    genius_about_flush(&mut current, &mut paragraphs);
+                    continue;
+                }
+                if node.is_text() {
+                    current.push_str(&node.text());
+                    continue;
+                }
+                let name = node.node_name();
+                let name = name.as_deref().unwrap_or_default();
+                let excluded_class = node.class().is_some_and(|classes| classes.split_ascii_whitespace().any(|class| {
+                    class == "lyrics" || class.starts_with("Lyrics__") || class.starts_with("LyricsHeader__") || class.starts_with("InreadAd__")
+                }));
+                if matches!(name, "script" | "style" | "noscript" | "button" | "svg") || excluded_class
+                    || node.attr("data-lyrics-container").is_some_and(|v| v.eq_ignore_ascii_case("true"))
+                    || node.attr("data-exclude-from-selection").is_some_and(|v| v.eq_ignore_ascii_case("true"))
+                    || node.attr("aria-hidden").is_some_and(|v| v.eq_ignore_ascii_case("true"))
+                    || (name == "a" && node.text().trim().eq_ignore_ascii_case("read more"))
+                {
+                    continue;
+                }
+                if name == "br" {
+                    current.push(' ');
+                } else {
+                    if matches!(name, "p" | "div" | "section" | "blockquote" | "li") {
+                        genius_about_flush(&mut current, &mut paragraphs);
+                        stack.push((node, true));
+                    }
+                    stack.extend(node.children_it(true).map(|child| (child, false)));
+                }
+            }
+            genius_about_flush(&mut current, &mut paragraphs);
+            let text = paragraphs.join("\n\n");
+            if text.is_empty() {
+                continue;
+            }
+            if text.chars().count() <= MAX_CHARS {
+                return Some(text);
+            }
+            // Include the ellipsis in the limit and prefer a nearby word boundary.
+            let end = text.char_indices().nth(MAX_CHARS - 1).map_or(text.len(), |(i, _)| i);
+            let prefix = &text[..end];
+            let end = prefix.rfind(char::is_whitespace).filter(|i| prefix[..*i].chars().count() >= MAX_CHARS / 2).unwrap_or(prefix.len());
+            return Some(format!("{}…", prefix[..end].trim_end()));
+        }
+    }
+    None
+}
+
+fn genius_about_flush(current: &mut String, paragraphs: &mut Vec<String>) {
+    let cleaned = current.replace(['\u{200b}', '\u{feff}'], " ");
+    let text = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !text.is_empty() {
+        paragraphs.push(text);
+    }
+    current.clear();
 }
 
 // ------------------------------------------------------------------- QRC
@@ -1461,6 +2015,397 @@ pub fn parse_ttml(text: &str, song_ms: i32) -> Ttml {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn genius_provider_is_last_and_unsynced() {
+        assert_eq!(Provider::ALL.last(), Some(&Provider::GeniusPlain));
+        assert_eq!(Provider::from_key("genius-plain"), Some(Provider::GeniusPlain));
+        assert_eq!(Provider::GeniusPlain.name(), "Genius");
+        assert_eq!(Provider::GeniusPlain.sync(), SyncKind::Unsynced);
+        let lyrics = Lyrics::new(Provider::GeniusPlain, parse_plain("One\nTwo"), None, vec![]).unwrap();
+        assert_eq!(lyrics.sync, Sync::None);
+    }
+
+    #[test]
+    fn genius_fetch_keeps_the_combined_future_send() {
+        fn assert_send<T: Send>(_: T) {}
+        let client = Client::new(reqwest::Client::new(), &std::env::temp_dir());
+        let q = Query { video_id: "id", song: "Song", artist: "Artist", album: None, duration: None };
+        let ticket = client.begin_fetch("id", 1);
+        assert_send(client.fetch(&q, &ticket, true, |_| {}));
+    }
+
+    fn test_lyrics(provider: Provider) -> Lyrics {
+        Lyrics::new(provider, parse_plain("line"), None, vec![]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn fast_genius_publishes_while_stream_is_pending() {
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let (send_partial, mut partial) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            gather_lyrics(
+                async move { wait.await.unwrap(); Ok(vec![test_lyrics(Provider::LrclibPlain)]) },
+                async { Ok(vec![]) }, async { Ok(vec![]) },
+                async { Ok(vec![test_lyrics(Provider::GeniusPlain)]) },
+                |set| { let _ = send_partial.send(set); },
+            ).await
+        });
+        let first = tokio::time::timeout(Duration::from_secs(1), partial.recv()).await.unwrap().unwrap();
+        assert_eq!(first.sources[0].provider, Provider::GeniusPlain);
+        assert!(!task.is_finished());
+        release.send(()).unwrap();
+        let (final_set, ok) = task.await.unwrap();
+        assert!(ok);
+        assert_eq!(final_set.sources.iter().map(|l| l.provider).collect::<Vec<_>>(), vec![Provider::LrclibPlain, Provider::GeniusPlain]);
+    }
+
+    #[tokio::test]
+    async fn fast_other_provider_publishes_while_genius_is_pending() {
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let (send_partial, mut partial) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            gather_lyrics(
+                async { Ok(vec![test_lyrics(Provider::LrclibPlain)]) },
+                async { Ok(vec![]) }, async { Ok(vec![]) },
+                async move { wait.await.unwrap(); Err(anyhow::anyhow!("failure")) },
+                |set| { let _ = send_partial.send(set); },
+            ).await
+        });
+        let first = tokio::time::timeout(Duration::from_secs(1), partial.recv()).await.unwrap().unwrap();
+        assert_eq!(first.sources[0].provider, Provider::LrclibPlain);
+        release.send(()).unwrap();
+        let (final_set, ok) = task.await.unwrap();
+        assert!(!ok);
+        assert_eq!(final_set.sources[0].provider, Provider::LrclibPlain);
+    }
+
+    #[test]
+    fn newer_final_cannot_be_replaced_by_an_older_request() {
+        let client = Client::new(reqwest::Client::new(), &std::env::temp_dir());
+        let old = client.begin_fetch("same", 1);
+        assert!(old.is_current());
+        let new = client.begin_fetch("same", 2);
+        assert!(!old.is_current());
+        assert!(new.is_current());
+        let old_set = LyricsSet { sources: vec![test_lyrics(Provider::LrclibPlain)] };
+        let new_set = LyricsSet { sources: vec![test_lyrics(Provider::GeniusPlain)] };
+        old.cache_final(true, &old_set);
+        assert!(old.cached(true).is_none());
+        new.cache_final(true, &new_set);
+        new.cache_final(true, &new_set);
+        drop(new);
+        old.cache_final(true, &old_set);
+        assert_eq!(old.cached(true).unwrap().sources[0].provider, Provider::GeniusPlain);
+        assert_eq!(client.recent.lock().unwrap().entries.len(), 1);
+        // Even eviction cannot allow the still-running old request to restore stale data.
+        for i in 0..RECENT {
+            let ticket = client.begin_fetch(&format!("other{i}"), 3 + i as u64);
+            ticket.cache_final(true, &new_set);
+        }
+        old.cache_final(true, &old_set);
+        assert!(old.cached(true).is_none());
+        drop(old);
+        assert!(client.recent.lock().unwrap().pending.is_empty());
+    }
+
+    #[test]
+    fn empty_newer_final_still_blocks_older_cache_write() {
+        let client = Client::new(reqwest::Client::new(), &std::env::temp_dir());
+        let old = client.begin_fetch("same", 1);
+        let new = client.begin_fetch("same", 2);
+        new.cache_final(true, &LyricsSet::default());
+        drop(new);
+        old.cache_final(true, &LyricsSet { sources: vec![test_lyrics(Provider::LrclibPlain)] });
+        assert!(old.cached(true).is_none());
+    }
+
+    #[tokio::test]
+    async fn cached_final_skips_interim_and_network() {
+        let client = Client::new(reqwest::Client::new(), &std::env::temp_dir());
+        let first = client.begin_fetch("id", 1);
+        first.cache_final(true, &LyricsSet { sources: vec![test_lyrics(Provider::GeniusPlain)] });
+        assert!(first.cached(false).is_none());
+        drop(first);
+        let ticket = client.begin_fetch("id", 2);
+        let q = Query { video_id: "id", song: "Song", artist: "Artist", album: None, duration: None };
+        let mut published = false;
+        let result = client.fetch(&q, &ticket, true, |_| published = true).await.unwrap();
+        assert!(!published);
+        assert_eq!(result.sources[0].provider, Provider::GeniusPlain);
+    }
+
+    #[test]
+    fn genius_page_drops_query_and_fragment() {
+        let url = genius_page_url("https://genius.com/a-song?token=secret#fragment").unwrap();
+        assert_eq!(url.as_str(), "https://genius.com/a-song");
+        assert!(genius_page_url("https://genius.com.evil.example/song?token=secret").is_err());
+    }
+
+    #[test]
+    fn genius_search_attempts_clean_and_keep_matching_context() {
+        let attempts = genius_search_attempts("Björk - Jóga (Official Video) | Live", "Björk");
+        assert_eq!(attempts[0].query, "Björk Jóga");
+        assert_eq!(attempts[0].title, "Jóga");
+        assert_eq!(attempts[0].artist, "Björk");
+        assert_eq!(genius_search_attempts("Björk — Jóga", "Björk")[0].query, "Björk Jóga");
+        assert_eq!(genius_search_attempts("Jóga: Björk", "Björk")[0].query, "Björk Jóga");
+        let attempts = genius_search_attempts("A Song (Part II)", "Artist");
+        assert!(attempts.iter().any(|a| a.query == "Artist A Song" && a.title == "A Song (Part II)"));
+        assert!(genius_search_attempts("   ", "Artist").is_empty());
+        assert_eq!(genius_clean_query("İ song Official Video"), "İ song");
+    }
+
+    #[test]
+    fn genius_search_requires_relevant_title_artist_and_safe_url() {
+        let response = serde_json::json!({"response": {"sections": [
+            {"type": "artist", "hits": [{"result": {"title": "Jóga", "artist_names": "Björk", "url": "https://genius.com/wrong"}}]},
+            {"type": "song", "hits": [
+                {"result": {"title": "Jóga", "artist_names": "Someone Else", "url": "https://genius.com/wrong-artist"}},
+                {"result": {"title": "Unrelated", "artist_names": "Björk", "url": "https://genius.com/wrong-title"}},
+                {"result": {"title": "Jóga", "artist_names": "Björk", "path": "/joga-translation", "url": "https://genius.com/translation"}},
+                {"result": {"title": "Jóga", "artist_names": "Björk", "url": "https://genius.com.evil.example/song"}},
+                {"result": {"title": "Jóga", "artist_names": "Björk", "url": "https://genius.com@evil.example/song"}},
+                {"result": {"title": "Jóga", "artist_names": "Björk & Guest", "url": "https://genius.com/partial"}},
+                {"result": {"title": "Jóga", "artist_names": "BJÖRK", "url": "https://genius.com/bjork-joga-lyrics"}}
+            ]}
+        ]}});
+        assert_eq!(best_genius_url(&response, "Jóga", "Björk").as_deref(), Some("https://genius.com/bjork-joga-lyrics"));
+        assert_eq!(best_genius_url(&response, "Jóga", "Another Artist"), None);
+        assert_eq!(best_genius_url(&response, "", "Björk"), None);
+        assert_eq!(best_genius_url(&serde_json::json!({"response": {"sections": []}}), "Jóga", "Björk"), None);
+        let empty_fields = serde_json::json!({"response": {"sections": [{"type": "song", "hits": [
+            {"result": {"title": "", "artist_names": "Björk", "url": "https://genius.com/x"}},
+            {"result": {"title": "Jóga", "artist_names": "", "url": "https://genius.com/y"}},
+            {"result": {"title": "Jóga", "primary_artist": {"name": "Björk"}, "url": "http://genius.com/z"}}
+        ]}]}});
+        assert_eq!(best_genius_url(&empty_fields, "Jóga", "Björk"), None);
+    }
+
+    #[test]
+    fn genius_search_avoids_partial_words_and_unrequested_variants() {
+        let response = serde_json::json!({"response": {"sections": [{"type": "song", "hits": [
+            {"result": {"title": "Cat", "artist_names": "The Artists", "url": "https://genius.com/cat"}},
+            {"result": {"title": "Cats", "artist_names": "The Artists", "url": "https://genius.com/cats"}},
+            {"result": {"title": "Cats", "artist_names": "The Artists", "path": "/cats-instrumental", "url": "https://genius.com/instrumental"}}
+        ]}]}});
+        assert_eq!(best_genius_url(&response, "Cats", "Artists").as_deref(), Some("https://genius.com/cats"));
+        assert_eq!(best_genius_url(&response, "Cats", "Artist"), None);
+        let variant = serde_json::json!({"response": {"sections": [{"type": "song", "hits": [
+            {"result": {"title": "Cats", "artist_names": "The Artists", "path": "/cats-instrumental", "url": "https://genius.com/instrumental"}}
+        ]}]}});
+        assert_eq!(best_genius_url(&variant, "Cats", "The Artists"), None);
+        assert_eq!(best_genius_url(&response, "Cats (Remix)", "The Artists"), None);
+        let generic_artist = serde_json::json!({"response": {"sections": [{"type": "song", "hits": [
+            {"result": {"title": "Cats", "artist_names": "The", "url": "https://genius.com/wrong"}}
+        ]}]}});
+        assert_eq!(best_genius_url(&generic_artist, "Cats", "The Artists"), None);
+    }
+
+    #[test]
+    fn genius_about_parses_only_description_paragraphs() {
+        let html = r#"<div data-lyrics-container="true">Not a meaning</div>
+            <div data-testid="song-description">
+              <p> A&nbsp;<a href="/x">song &amp; <b>story</b></a>.<br>More text.</p>
+              <p>Second&#39;s <em>paragraph</em>.</p>
+              <button>Read More</button><a href="/x">Read More</a>
+              <script>junk</script><span aria-hidden="true">hidden</span>
+              <div data-lyrics-container="true">[Verse]<br>Not the description</div>
+              <div class="lyrics">Not legacy lyrics either</div>
+            </div><div class="SongBioPreview-desktop__Container-sc-x">Wrong fallback</div>"#;
+        assert_eq!(parse_genius_about(html).as_deref(), Some("A song & story. More text.\n\nSecond's paragraph."));
+    }
+
+    #[test]
+    fn genius_about_fallback_and_missing_description() {
+        let preview = "<div data-testid='song-description'><button>Read more</button></div><div class='SongBioPreview-desktop__Container-sc-1'><div>First</div><div>Second</div></div>";
+        assert_eq!(parse_genius_about(preview).as_deref(), Some("First\n\nSecond"));
+        assert_eq!(parse_genius_about("<div class='SongBioPreview__Container-ab'>A bio</div>").as_deref(), Some("A bio"));
+        assert_eq!(parse_genius_about("<div data-lyrics-container='true'>Lyrics</div><div class='lyrics'>More lyrics</div>"), None);
+        assert_eq!(parse_genius_about("<title>Just a moment...</title><body>Checking your browser</body>"), None);
+        assert_eq!(parse_genius_about("<div data-testid='song-description' data-lyrics-container='true'>Lyrics</div>"), None);
+        assert_eq!(parse_genius_about("<div data-testid='song-description'> &nbsp; <button>Read more</button></div>"), None);
+    }
+
+    #[test]
+    fn genius_about_is_capped_on_unicode_and_long_words() {
+        let text = "界".repeat(1000);
+        let description = parse_genius_about(&format!("<div data-testid='song-description'><p>{text}</p></div>")).unwrap();
+        assert_eq!(description.chars().count(), 900);
+        assert!(description.ends_with('…'));
+        let text = format!("{} {}", "words ".repeat(150), "long".repeat(200));
+        let description = parse_genius_about(&format!("<div data-testid='song-description'>{text}</div>")).unwrap();
+        assert!(description.chars().count() <= 900 && description.ends_with('…'));
+    }
+
+    #[test]
+    fn genius_about_matching_rejects_wrong_artist_and_unsafe_redirects() {
+        let hits = serde_json::json!({"response": {"sections": [{"type": "song", "hits": [
+            {"result": {"title": "Jóga", "artist_names": "Someone Else", "url": "https://genius.com/cover"}},
+            {"result": {"title": "Jóga", "artist_names": "Björk", "url": "https://genius.com.evil.example/song"}},
+            {"result": {"title": "Jóga", "artist_names": "Björk", "url": "https://genius.com/bjork-joga-lyrics"}}
+        ]}]}});
+        let attempt = &genius_search_attempts("Björk - Jóga (Official Video)", "Björk")[0];
+        assert_eq!(best_genius_url(&hits, &attempt.title, &attempt.artist).as_deref(), Some("https://genius.com/bjork-joga-lyrics"));
+        assert_eq!(best_genius_url(&hits, &attempt.title, "Unrelated"), None);
+        assert_eq!(best_genius_url(&serde_json::json!({}), &attempt.title, &attempt.artist), None);
+        for unsafe_url in ["http://genius.com/x", "https://genius.com:8443/x", "https://genius.com@evil.example/x", "https://user:pass@genius.com/x"] {
+            assert!(!safe_genius_url(&url::Url::parse(unsafe_url).unwrap()));
+        }
+        assert!(safe_genius_url(&url::Url::parse("https://www.genius.com/song").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn genius_about_missing_title_or_artist_needs_no_network() {
+        let client = Client::new(reqwest::Client::new(), &std::env::temp_dir());
+        let q = Query { video_id: "id", song: "", artist: "Artist", album: None, duration: None };
+        assert_eq!(client.genius_about(&q).await.unwrap(), None);
+        let q = Query { video_id: "id", song: "Song", artist: " ", album: None, duration: None };
+        assert_eq!(client.genius_about(&q).await.unwrap(), None);
+        let q = Query { video_id: "id", song: "Song", artist: "(Official Video)", album: None, duration: None };
+        assert_eq!(client.genius_about(&q).await.unwrap(), None);
+        assert!(client.genius_about_http.get().is_none());
+    }
+
+    fn genius_test_server(reply: &'static str) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(reply.as_bytes());
+        });
+        format!("http://{address}/?secret=do-not-log")
+    }
+
+    #[tokio::test]
+    async fn genius_about_rejects_unsafe_redirects_and_oversized_bodies() {
+        let http = reqwest::Client::builder().no_proxy().redirect(genius_redirect_policy()).build().unwrap();
+        let url = genius_test_server("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/?secret=redirect-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let response = http.get(url).send().await.unwrap();
+        assert!(response.status().is_redirection());
+        let error = genius_bounded_body(response, 5).await.unwrap_err();
+        assert!(!format!("{error:#}").contains("secret"));
+
+        let url = genius_test_server("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\nabcdef\r\n0\r\n\r\n");
+        let response = http.get(url).send().await.unwrap();
+        assert!(genius_bounded_body(response, 5).await.is_err());
+        let url = genius_test_server("HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let response = http.get(url).send().await.unwrap();
+        let error = genius_bounded_body(response, 5).await.unwrap_err();
+        assert!(!format!("{error:#}").contains("secret"));
+    }
+
+    /// Live: the plain scrape a song's Genius source runs, from this machine's network and
+    /// through the rustls client. It answers 403 to the system's TLS stack, so this is the
+    /// only check that the client Genius is willing to talk to is still the one we build.
+    /// `cargo test --release -- --ignored genius_plain_live --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn genius_plain_live() {
+        let client = Client::new(reqwest::Client::new(), &std::env::temp_dir());
+        let q = Query { video_id: "id", song: "Jóga", artist: "Björk", album: None, duration: None };
+        let found = client.fetch_genius(&q).await.expect("Genius refused the lookup");
+        let lyrics = found.first().expect("Genius matched no song");
+        assert_eq!(lyrics.provider, Provider::GeniusPlain);
+        assert!(lyrics.lines.iter().any(|l| !l.text.trim().is_empty()), "Genius page held no lyrics");
+    }
+
+    #[test]
+    fn genius_html_preserves_lines_sections_entities_and_excludes_ui() {
+        let html = r#"<html><body>Outside
+            <div data-lyrics-container="true">[Verse 1]<br>Hello&nbsp;<a>world &amp; <b>friends</b></a><br><br>二&#x754C;<span>12You might also like</span><span data-exclude-from-selection="true">translation</span><button>Share</button><script>script</script><style>style</style><div class="LyricsHeader__Container-sc-abc">heading</div><div data-lyrics-container="true"><p>Next&#39;s line</p></div></div>
+            <div data-lyrics-container="true">Last line123Embed</div><div class="lyrics">Legacy must not appear</div>
+        </body></html>"#;
+        let lines = parse_genius_html(html);
+        assert_eq!(lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            vec!["[Verse 1]", "Hello world & friends", "", "二界", "Next's line", "Last line"]);
+        assert!(lines.iter().all(|l| l.start == 0 && l.parts.is_empty()));
+    }
+
+    #[test]
+    fn genius_html_handles_legacy_empty_and_challenge_pages() {
+        let legacy = "<div class='lyrics'><p>First<br>second</p><p>Third\u{200b}line</p></div>";
+        assert_eq!(parse_genius_html(legacy).iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), vec!["First", "second", "Third line"]);
+        assert!(parse_genius_html("<html><title>Just a moment...</title><body>Checking your browser</body></html>").is_empty());
+        assert!(parse_genius_html("<div data-lyrics-container='true'>You might also like<br>123Embed</div>").is_empty());
+        assert!(parse_genius_html("<div data-lyrics-container='true'></div><div class='lyrics'>Wrong fallback</div>").is_empty());
+    }
+
+    #[test]
+    fn genius_html_many_containers_and_deep_ancestors() {
+        for attr in ["data-lyrics-container='true'", "class='lyrics'"] {
+            let mut html = "<section>".repeat(1_200);
+            for _ in 0..12_000 {
+                html.push_str(&format!("<div {attr}>line</div>"));
+            }
+            html.push_str(&"</section>".repeat(1_200));
+            assert!(html.len() < 4 * 1024 * 1024);
+            let lines = parse_genius_html(&html);
+            assert_eq!(lines.len(), 12_000);
+            assert!(lines.iter().all(|line| line.text == "line"));
+        }
+    }
+
+    #[test]
+    fn genius_html_nested_containers_respect_exclusions_and_order() {
+        let mut html = String::from("<div class='LyricsHeader__Container-x'><div data-lyrics-container='true'>Outside</div></div>");
+        html.push_str(&"<div data-lyrics-container='true'>".repeat(1_000));
+        html.push_str("First<div data-exclude-from-selection='true'><div data-lyrics-container='true'>Hidden</div></div><br>Second");
+        html.push_str(&"</div>".repeat(1_000));
+        html.push_str("<div data-lyrics-container='true'>Last</div><div class='lyrics'>Ignored</div>");
+        let lines = parse_genius_html(&html);
+        assert_eq!(lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), vec!["Outside", "First", "Second", "Last"]);
+    }
+
+    #[test]
+    fn genius_html_removes_many_markers_in_one_pass() {
+        let text = "界123yOu MiGhT aLsO LiKe".repeat(40_000);
+        let html = format!("<div data-lyrics-container='true'>{text}</div>");
+        assert!(html.len() < 4 * 1024 * 1024);
+        let lines = parse_genius_html(&html);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "界".repeat(40_000));
+
+        // Each removal exposes the next marker and its preceding ASCII digits.
+        let text = format!("{}You Might Also Like{}", "you might also 123".repeat(10_000), "like".repeat(10_000));
+        let html = format!("<div data-lyrics-container='true'>{text}</div>");
+        assert!(parse_genius_html(&html).is_empty());
+
+        // The first removal joins fragments into another marker, including across nodes.
+        let html = "<div data-lyrics-container='true'>前 you might also <span>345YOU MIGHT ALSO LIKE</span>like 後<br>é１２3You Might Also Like界</div>";
+        let lines = parse_genius_html(html);
+        assert_eq!(lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), vec!["前  後", "é１２界"]);
+    }
+
+    #[test]
+    fn genius_html_marker_cleanup_matches_original_repeated_removal() {
+        let pieces = ["you", " might also ", "like", "You might also like", "7", "界", "x", "YOU MIGHT ALSO LIKE", "\u{200b}", "y"];
+        let mut state = 7_u64;
+        for _ in 0..500 {
+            let mut text = String::new();
+            for _ in 0..12 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                text.push_str(pieces[(state >> 32) as usize % pieces.len()]);
+            }
+            let mut expected = text.replace(['\u{00a0}', '\u{200b}', '\u{feff}'], " ");
+            while let Some(pos) = expected.to_ascii_lowercase().find("you might also like") {
+                let mut start = pos;
+                while start > 0 && expected.as_bytes()[start - 1].is_ascii_digit() {
+                    start -= 1;
+                }
+                expected.replace_range(start..pos + "you might also like".len(), "");
+            }
+            let expected = expected.trim();
+            let html = format!("<div data-lyrics-container='true'>{text}</div>");
+            let lines = parse_genius_html(&html);
+            let actual = lines.iter().map(|line| line.text.as_str()).collect::<Vec<_>>();
+            let expected = if expected.is_empty() { vec![] } else { vec![expected] };
+            assert_eq!(actual, expected, "input: {text:?}");
+        }
+    }
 
     #[test]
     fn enhanced_lrc_parts() {

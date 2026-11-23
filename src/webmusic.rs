@@ -333,46 +333,82 @@ impl Session {
             "racyCheckOk": true,
         });
         let resp = self.post(http, "https://music.youtube.com", "player", ("67", VERSION, UA), body).await?;
-        let status = &resp["playabilityStatus"];
-        if status["status"] != "OK" {
-            anyhow::bail!("{}: {}", status["status"].as_str().unwrap_or("UNPLAYABLE"), status["reason"].as_str().unwrap_or("no reason given"));
-        }
-        // 141 is Premium's 256 kbps AAC-LC; 140 is the usual 128 kbps.
-        let formats = resp["streamingData"]["adaptiveFormats"].as_array().map(Vec::as_slice).unwrap_or_default();
-        let f = [141, 140, 139]
-            .iter()
-            .find_map(|itag| formats.iter().find(|f| f["itag"] == *itag))
-            .ok_or_else(|| anyhow::anyhow!("no AAC stream in web player response"))?;
-        log::info!("web music: {video_id} itag {} ({} kbps)", f["itag"], f["bitrate"].as_u64().unwrap_or(0) / 1000);
-        let size = f["contentLength"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| anyhow::anyhow!("unknown stream size"))?;
-        let duration_ms = f["approxDurationMs"].as_str().and_then(|d| d.parse().ok()).unwrap_or(0);
-        let loudness_db = crate::innertube::loudness(&resp, f);
-
-        // Either a plain URL, or `signatureCipher` = s=<challenge>&sp=<param>&url=<url>.
-        let (raw, cipher) = match f["url"].as_str() {
-            Some(u) => (u.to_owned(), None),
-            None => {
-                let c = f["signatureCipher"].as_str().ok_or_else(|| anyhow::anyhow!("format has no URL"))?;
-                let q: Vec<(String, String)> = Url::parse(&format!("http://x/?{c}"))?.query_pairs().into_owned().collect();
-                let get = |k: &str| q.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
-                let url = get("url").ok_or_else(|| anyhow::anyhow!("cipher has no url"))?;
-                let s = get("s").ok_or_else(|| anyhow::anyhow!("cipher has no signature"))?;
-                (url, Some((s, get("sp").unwrap_or_else(|| "signature".into()))))
-            }
-        };
-        let mut url = Url::parse(&raw)?;
-        let mut pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
-        let n = pairs.iter().find(|(k, _)| k == "n").map(|(_, v)| v.clone());
-        let (n_out, sig_out) = solver.solve(&player, n, cipher.as_ref().map(|(s, _)| s.clone())).await?;
-        if let Some(n) = n_out {
-            pairs.iter_mut().filter(|(k, _)| k == "n").for_each(|(_, v)| *v = n.clone());
-        }
-        if let (Some(sig), Some((_, sp))) = (sig_out, cipher) {
-            pairs.push((sp, sig));
-        }
-        url.query_pairs_mut().clear().extend_pairs(pairs);
-        Ok(Stream { url: url.into(), size, duration_ms, loudness_db, opus: false })
+        decode_stream(&resp, video_id, solver, &player).await
     }
+}
+
+/// The same question asked without a sign-in: `WEB_REMIX` with the bare consent cookie.
+/// Some clips the visionOS player refuses (ones YouTube marks as made for kids) play here,
+/// and so do songs whose signed-in answer comes back without a stream.
+pub async fn audio_stream_anon(http: &reqwest::Client, solver: &Solver, video_id: &str) -> anyhow::Result<Stream> {
+    let player = solver.player(http).await?;
+    let body = json!({
+        "context": {"client": {"clientName": "WEB_REMIX", "clientVersion": VERSION, "hl": "en", "gl": "US"}},
+        "videoId": video_id,
+        "playbackContext": {"contentPlaybackContext": {"html5Preference": "HTML5_PREF_WANTS", "signatureTimestamp": player.sts}},
+        "contentCheckOk": true,
+        "racyCheckOk": true,
+    });
+    let resp: Value = http
+        .post("https://music.youtube.com/youtubei/v1/player?prettyPrint=false")
+        .header("User-Agent", UA)
+        .header("X-YouTube-Client-Name", "67")
+        .header("X-YouTube-Client-Version", VERSION)
+        .header("Origin", "https://music.youtube.com")
+        .header("X-Origin", "https://music.youtube.com")
+        .header("Cookie", "SOCS=CAISAiAD")
+        .timeout(std::time::Duration::from_secs(12))
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    decode_stream(&resp, video_id, solver, &player).await
+}
+
+/// The stream inside a WEB_REMIX player answer: its AAC format, address and the challenge
+/// work that address needs. Signed-in and anonymous asks read the same shape.
+async fn decode_stream(resp: &Value, video_id: &str, solver: &Solver, player: &crate::jsc::Player) -> anyhow::Result<Stream> {
+    let status = &resp["playabilityStatus"];
+    if status["status"] != "OK" {
+        anyhow::bail!("{}: {}", status["status"].as_str().unwrap_or("UNPLAYABLE"), status["reason"].as_str().unwrap_or("no reason given"));
+    }
+    // 141 is Premium's 256 kbps AAC-LC; 140 is the usual 128 kbps.
+    let formats = resp["streamingData"]["adaptiveFormats"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let f = [141, 140, 139]
+        .iter()
+        .find_map(|itag| formats.iter().find(|f| f["itag"] == *itag))
+        .ok_or_else(|| anyhow::anyhow!("no AAC stream in web player response"))?;
+    log::info!("web music: {video_id} itag {} ({} kbps)", f["itag"], f["bitrate"].as_u64().unwrap_or(0) / 1000);
+    let size = f["contentLength"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| anyhow::anyhow!("unknown stream size"))?;
+    let duration_ms = f["approxDurationMs"].as_str().and_then(|d| d.parse().ok()).unwrap_or(0);
+    let loudness_db = crate::innertube::loudness(resp, f);
+
+    // Either a plain URL, or `signatureCipher` = s=<challenge>&sp=<param>&url=<url>.
+    let (raw, cipher) = match f["url"].as_str() {
+        Some(u) => (u.to_owned(), None),
+        None => {
+            let c = f["signatureCipher"].as_str().ok_or_else(|| anyhow::anyhow!("format has no URL"))?;
+            let q: Vec<(String, String)> = Url::parse(&format!("http://x/?{c}"))?.query_pairs().into_owned().collect();
+            let get = |k: &str| q.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+            let url = get("url").ok_or_else(|| anyhow::anyhow!("cipher has no url"))?;
+            let s = get("s").ok_or_else(|| anyhow::anyhow!("cipher has no signature"))?;
+            (url, Some((s, get("sp").unwrap_or_else(|| "signature".into()))))
+        }
+    };
+    let mut url = Url::parse(&raw)?;
+    let mut pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+    let n = pairs.iter().find(|(k, _)| k == "n").map(|(_, v)| v.clone());
+    let (n_out, sig_out) = solver.solve(player, n, cipher.as_ref().map(|(s, _)| s.clone())).await?;
+    if let Some(n) = n_out {
+        pairs.iter_mut().filter(|(k, _)| k == "n").for_each(|(_, v)| *v = n.clone());
+    }
+    if let (Some(sig), Some((_, sp))) = (sig_out, cipher) {
+        pairs.push((sp, sig));
+    }
+    url.query_pairs_mut().clear().extend_pairs(pairs);
+    Ok(Stream { url: url.into(), size, duration_ms, loudness_db, opus: false })
 }
 
 #[cfg(test)]

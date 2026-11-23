@@ -13,6 +13,7 @@ bytes = "1.12.1"
 crossbeam-channel = "0.5.17"
 directories = "6.0.0"
 discord-rich-presence = "1.1.0"
+dom_query = { version = "0.28.0", default-features = false }
 eframe = { version = "0.37", default-features = false, features = ["glow", "wgpu_no_default_features", "default_fonts", "links", "clipboard", "accesskit", "persistence", "wayland", "x11"] }
 egui = { version = "0.37.0", features = ["monochrome_emoji_fonts"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
@@ -25,9 +26,16 @@ localzone = "0.3.1"
 log = "0.4.34"
 memmap2 = "0.9.11"
 raw-window-handle = "0.6"
-reqwest = { version = "0.12", default-features = false, features = ["default-tls", "gzip", "json", "socks"] }
-rodio = { version = "0.22.2", default-features = false, features = ["playback", "symphonia-aac", "symphonia-isomp4", "symphonia-flac", "symphonia-alac", "symphonia-wav", "symphonia-mp3", "symphonia-vorbis"] }
+# The one client that can also speak rustls is Genius's (lyrics.rs): its bot filter scores
+# the TLS handshake itself, and the system stack's signature is refused.
+reqwest = { version = "0.12", default-features = false, features = ["default-tls", "rustls-tls-native-roots", "gzip", "json", "socks", "multipart"] }
+# A fan list's files are whatever its keepers uploaded: WAV and AIFF (the RIFF readers
+# need symphonia's PCM codec), Ogg, MP4, MP3 and FLAC. Without the codec a real file
+# still opens its container and then refuses it, which reads as an unknown format.
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "symphonia-aac", "symphonia-isomp4", "symphonia-flac", "symphonia-alac", "symphonia-wav", "symphonia-aiff", "symphonia-pcm", "symphonia-mp3", "symphonia-ogg", "symphonia-vorbis"] }
 rquickjs = "0.14.0"
+# Reading app.ron the way eframe does, to tell a good copy from a broken one (main.rs).
+ron = "0.12"
 roxmltree = "0.21.1"
 serde = { version = "1.0.229", features = ["derive"] }
 skrifa = "0.44.0"
@@ -37,7 +45,7 @@ hmac = "0.12.1"
 serde_json = "1.0.151"
 souvlaki = "0.8.3"
 tao = "0.37.1"
-tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
 wry = "0.57.0"
 rfd = "0.17.2"
 tray-icon = "0.26.1"
@@ -55,7 +63,9 @@ unicode-bidi = "0.3"
 [target.'cfg(windows)'.dependencies]
 # Windows Credential Manager, for the Google and Spotify sign-ins.
 keyring = { version = "3.6.3", features = ["windows-native"] }
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Media_MediaFoundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Registry", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# WASAPI exclusive output for bit-perfect playback (bitperfect.rs).
+wasapi = "0.27.0"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Media_MediaFoundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_Variant", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # The Secret Service (GNOME Keyring, KWallet) for the sign-ins.

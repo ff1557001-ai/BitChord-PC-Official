@@ -163,8 +163,10 @@ pub struct ThemeCss {
 impl Default for LyricStyle {
     fn default() -> Self {
         Self {
-            // The app's own look: the player's lyric sheet — lines already sung
-            // let go, lines still to come wait out of focus.
+            // The reference's own motion: every line stays legible, the ones further from
+            // the line being sung step down in brightness and soften a little more each
+            // row, and the sung line keeps its size instead of swelling. Where the sheet
+            // sits in the view stays the listener's `anchor`.
             align: Align::Left,
             weight: Weight::Bold,
             font: "sfpro".into(),
@@ -172,18 +174,18 @@ impl Default for LyricStyle {
             line_gap: 0.6,
             anchor: 0.43,
             fill: Fill::Sweep,
-            active_alpha: 0.3,
-            inactive_alpha: 0.3,
-            falloff: 0.01,
-            min_alpha: 0.25,
-            past_alpha: Some(0.0),
+            active_alpha: 0.8,
+            inactive_alpha: 0.8,
+            falloff: 0.1,
+            min_alpha: 0.46,
+            past_alpha: None,
             sung_color: "white".into(),
-            blur: 2.0,
-            blur_scope: BlurScope::Upcoming,
+            blur: 2.4,
+            blur_scope: BlurScope::All,
             glow: 0.0,
             glow_color: "white".into(),
-            active_scale: 1.05,
-            lift: 3.0,
+            active_scale: 1.0,
+            lift: 6.0,
             css: None,
         }
     }

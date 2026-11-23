@@ -102,6 +102,11 @@ impl Session {
         self.conn.is_some()
     }
 
+    /// The room's share code, or nothing when we're not in one.
+    pub fn code(&self) -> String {
+        if self.active() { self.party.code.clone() } else { String::new() }
+    }
+
     pub fn is_host(&self) -> bool {
         self.active() && self.party.you_host()
     }
@@ -253,7 +258,7 @@ pub fn dev_script(app: &mut App, ctx: &egui::Context, now: f64) {
                 }
             }
             a if a.starts_with("add=") => {
-                let track = crate::model::Track { id: a[4..].to_owned(), title: "Test song".into(), artists: vec![], album: None, duration: None, thumbs: vec![], track_nr: None, plays: None, music_video: false };
+                let track = crate::model::Track { id: a[4..].to_owned(), title: "Test song".into(), artists: vec![], album: None, duration: None, thumbs: vec![], track_nr: None, plays: None, music_video: false, episode: false };
                 app.apply(Action::Enqueue(track));
             }
             a if a.starts_with("seek=") => {
@@ -700,6 +705,8 @@ pub fn refused(app: &App, a: &Action) -> bool {
         // The song already playing is a pause, and pausing is ours to do here.
         Action::Play(tracks, i) => !tracks.get(*i).is_some_and(|t| app.current_id() == Some(t.id.as_str())),
         Action::PlayCollection(..)
+        | Action::PlayShuffled(_)
+        | Action::MoodStation(_)
         | Action::PlayNext(_)
         | Action::Enqueue(_)
         | Action::Radio(_)
@@ -707,6 +714,7 @@ pub fn refused(app: &App, a: &Action) -> bool {
         | Action::QueueJump(_)
         | Action::QueueRemove(_)
         | Action::QueueMove(..)
+        | Action::QueuePlayNext(_)
         | Action::Seek(_) => true,
         _ => false,
     }

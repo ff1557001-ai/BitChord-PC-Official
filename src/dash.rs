@@ -84,7 +84,7 @@ async fn get(http: &reqwest::Client, url: &str) -> anyhow::Result<Vec<u8>> {
 /// URL the reqwest error would print.
 fn wire(e: reqwest::Error) -> anyhow::Error {
     if let Some(s) = e.status() {
-        anyhow::anyhow!("the rendition answered HTTP {}", s.as_u16())
+        anyhow::anyhow!("the rendition answered with HTTP {}", s.as_u16())
     } else if e.is_timeout() {
         anyhow::anyhow!("the rendition timed out")
     } else if e.is_connect() {

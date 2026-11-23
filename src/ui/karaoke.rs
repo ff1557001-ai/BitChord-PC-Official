@@ -1,25 +1,33 @@
-//! Synced lyrics, ported from Better Lyrics' renderer (`@braccato/core` 1.16: engine.js,
-//! inject.js, instrumental.js, lyrics.css, variables.css) to egui.
+//! Synced lyrics: the word motion, wrapping and scroll ported from binimum/am-lyrics
+//! v1.9 (Mozilla Public License 2.0) and the clock offsets from Better Lyrics' renderer
+//! (`@braccato/core` 1.16: engine.js, inject.js, instrumental.js, lyrics.css, variables.css),
+//! to egui.
 //!
 //! What is the same as the extension, by construction:
 //! - Timing: the clock is shown 150 ms ahead for word-synced lyrics and 115 ms for
-//!   line-synced ones, and the view scrolls 0.5 s ahead of that.
+//!   line-synced ones, and the view scrolls ahead of that by the gap to the next line,
+//!   between 350 and 500 ms.
 //! - Words: every provider part is split on whitespace with its time pro-rated by
-//!   characters; words between spaces form groups that never wrap unless longer than 20
-//!   characters.
-//! - Karaoke: each word has a lit copy over the dim one, revealed by a linear gradient
-//!   (soft edge one tenth of the word wide) that runs from -0.2..-0.1 to 1.4..1.5 over 1.6×
-//!   the word's duration, 10 % ahead of it. With letters split (the default "letter
-//!   wave"), the gradient advances letter by letter in index space, each letter floats up
-//!   as it is lit, and the word group gives a small sideways pop.
-//! - Glow: `drop-shadow(0 0 0.8rem glow-color)` on the lit copy, decaying to nothing over
-//!   max(1.2×, 1.2 s) with `ease`: a Gaussian blur of the lit glyph pixels only (never a box).
-//!   Held words (over 1.5 s) instead swell to 1.7× and stay there while they are sung, the
-//!   way Apple Music lights a long note — beyond 2× the line washes out.
-//! - Lines: scale 0.95 → 1 over 166 ms when they start, back when they end; lit words
-//!   fade back to dim over 0.5 s once the next line starts.
-//! - Scrolling: the view jumps to the new position and every line eases from where it was,
-//!   lines further down taking a little longer (cubic-bezier(0.86, 0, 0.2, 1), 750 ms +).
+//!   characters; words between spaces form groups that never wrap unless 16 characters
+//!   or more.
+//! - Karaoke: each word has a lit copy over the dim one. The lit copy is revealed by the
+//!   am-lyrics wipe: a linear gradient whose feather is 0.75 em (a little wider for a long
+//!   word, 0.3 em for a script that can't split) and whose edge runs straight across
+//!   `width + feather` over the word's duration. Where two words run together (under 180 ms
+//!   apart) the next word's feather creeps in before its timestamp, so the highlight hands
+//!   off without a gap.
+//! - Letters: a word rises whole on the extension's 2 s spring — `.normal-word-motion` gives
+//!   every glyph of it the same lift, so nothing on screen moves letter by letter. Only the
+//!   scripts the extension marks `char-rise` (Han, kana, Hangul) are left out of that class
+//!   and rise glyph by glyph, fanning and swelling while they're held.
+//! - Glow: `text-shadow 0 0 0.3em` on the lit glyphs, breathing 0 → 0.8 → 1 → 0.3 → 0 across
+//!   each glyph's animation and only on held words, never on CJK: a Gaussian blur of the lit
+//!   glyph pixels (never a box).
+//! - Lines: scale 0.98 → 1 when they start, back when they end, and no blur on the line about
+//!   to be sung (`.pre-active`); lit words fade back to dim over 0.5 s once the next line starts.
+//! - Scrolling: the view jumps to the new position and every line eases from where it was
+//!   in 400 ms on `cubic-bezier(0.2, 0.8, 0.2, 1)`, a line further from the sung one
+//!   waiting 50 ms for each step, four at most.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -88,10 +96,9 @@ impl Bezier {
 
 pub const EASE: Bezier = Bezier(0.25, 0.1, 0.25, 1.0);
 pub const EASE_IN: Bezier = Bezier(0.42, 0.0, 1.0, 1.0);
-pub const EASE_OUT: Bezier = Bezier(0.0, 0.0, 0.58, 1.0);
 pub const EASE_IN_OUT: Bezier = Bezier(0.42, 0.0, 0.58, 1.0);
-/// `--blyrics-lyric-scroll-timing-function`.
-pub const SCROLL_EASE: Bezier = Bezier(0.86, 0.0, 0.2, 1.0);
+/// `.main-vocal-container`: the curve the view moves along while it scrolls.
+pub const SCROLL_EASE: Bezier = Bezier(0.2, 0.8, 0.2, 1.0);
 /// `blyrics-decoration-in`.
 const DECO_EASE: Bezier = Bezier(0.25, 1.0, 0.5, 1.0);
 
@@ -100,39 +107,130 @@ const DECO_EASE: Bezier = Bezier(0.25, 1.0, 0.5, 1.0);
 /// `--blyrics-richsync-timing-offset` / `--blyrics-timing-offset`.
 pub const RICHSYNC_OFFSET: f64 = 0.150;
 pub const LINE_OFFSET: f64 = 0.115;
-/// `--blyrics-scroll-timing-offset`.
-const SCROLL_OFFSET: f64 = 0.5;
+/// `scrollLookAheadMs`: the view runs ahead of the singing by the gap between the line
+/// being sung and the next one's start, held between these two.
+const SCROLL_AHEAD_MIN: f64 = 0.35;
+const SCROLL_AHEAD_MAX: f64 = 0.5;
+/// `AmLyrics.ts`: `frequency = 10`, and `LyricMotion` damps at `0.9 * frequency`. The
+/// frames run for `1.2 s` and are read linearly, so the view glides rather than snaps.
+const SCROLL_SPRING: (f64, f64, f64) = (10.0, 0.9, 1.2);
+/// `--scroll-duration`, and the cascade that lets each line further from the sung one
+/// start a little later, up to four of them.
+const SCROLL_DUR: f64 = SCROLL_SPRING.2;
+const SCROLL_CASCADE: f64 = 0.05;
 /// `blyrics-early-scroll-consider-s`.
 const EARLY_SCROLL: f64 = 0.54;
 /// `blyrics-lyric-ending-threshold-s`.
 const ENDING_THRESHOLD: f64 = 0.5;
 const TIME_JUMP: f64 = 0.5;
-/// `blyrics-swipe-lead-ratio`, `blyrics-swipe-duration-ratio` and the swipe ramp.
-const SWIPE_LEAD: f64 = 0.1;
-const SWIPE_DURATION: f64 = 1.6;
-const SWIPE_START: (f32, f32) = (-0.2, 1.4);
-const SWIPE_END: (f32, f32) = (-0.1, 1.5);
-const GLOW_RATIO: f64 = 1.2;
-const GLOW_MIN: f64 = 1.2;
-/// A held word's glow, Apple Music's way: it grows over the first `HOLD_RISE` seconds to
-/// `GLOW_SWELL` times its base (a cap, so a long note doesn't wash out the line), stays
-/// there while the word is sung, and gives it back over `GLOW_RELEASE` once it ends.
-const GLOW_SWELL: f64 = 1.7;
-const HOLD_RISE: f64 = 1.1;
-const GLOW_RELEASE: f64 = 0.9;
+/// `BASE_WIPE_GRADIENT_EM`, `LONG_WORD_WIPE_EXTRA_EM/_RATIO` and `CJK_WIPE_GRADIENT_EM`:
+/// the wipe's soft edge, in em of the word's own font.
+const FEATHER_EM: f32 = 0.75;
+const FEATHER_EXTRA_EM: f32 = 0.45;
+const FEATHER_LONG_FROM: f32 = 10.0;
+const FEATHER_CJK_EM: f32 = 0.3;
+/// `LONG_WORD_WIPE_EXTRA_RATIO`: how much longer a long word's wipe runs.
+const LONG_WIPE_RATIO: f64 = 0.35;
+/// `NEXT_WORD_PRE_WIPE_MAX_GAP_MS` / `_HANDOFF_LEAD_MS` / `_MIN` / `_MAX`: how early the
+/// next word's feather starts creeping in.
+const PRE_WIPE_GAP: f64 = 0.180;
+const PRE_WIPE_HANDOFF: f64 = 0.100;
+const PRE_WIPE_MIN: f64 = 0.080;
+const PRE_WIPE_MAX: f64 = 0.240;
+/// `text-shadow: 0 0 0.3em` and the `--char-glow-max` ceiling.
+const GLOW_EM: f32 = 0.3;
+const GLOW_MAX: f64 = 0.45;
+/// The glow's decay for the fills that don't wipe a word glyph by glyph.
+const GLOW_TAIL: f64 = 1.2;
+/// `--char-rise-y` is -3 px at the extension's 34 px: the fan's extra lift (2.25 px) and
+/// its sideways spread, in em.
+const FAN_LIFT_EM: f32 = 2.25 / 34.0;
+const FAN_SPREAD_EM: f32 = 0.05;
+/// `getCharacterFrames`: a glyph's motion is run for its word's response, no longer than
+/// three seconds.
+const LETTER_RESPONSE_MAX: f64 = 3.0;
 const FADE_IN: f64 = 0.33;
 const FADE_OUT: f64 = 0.5;
-const SCALE_DURATION: f64 = 0.166;
-const WOBBLE_DURATION: f64 = 1.0;
-const LETTER_WAVE_CREST: f32 = 0.4;
-/// `blyrics-long-word-threshold` (ms → s): held words swell their letters.
-const LONG_WORD: f64 = 1.5;
+/// `.lyrics-line-container`: `transform 0.5 s ease` into the sung line and
+/// `0.4 s cubic-bezier(.41,0,.12,.99)` back out of it.
+const SCALE_IN: f64 = 0.5;
+const SCALE_OUT: f64 = 0.4;
+const SETTLE: Bezier = Bezier(0.41, 0.0, 0.12, 0.99);
 /// `blyrics-line-synced-animation-delay`.
 const LINE_SYNC_DELAY: f64 = 0.05;
-/// Word groups longer than twice `blyrics-long-word-wrap-threshold` may break.
-const LONG_GROUP_CHARS: usize = 20;
-const USER_SCROLL_RESUME: f64 = 25.0;
+/// Word groups of `LONG_GROUP_CHARS` characters or more may break (`.allow-break`).
+const LONG_GROUP_CHARS: usize = 16;
+/// `USER_SCROLL_RESUME_DELAY_MS`: how long reading the words by hand holds the view
+/// before it goes back to the singing.
+const USER_SCROLL_RESUME: f64 = 5.0;
 const DECO_ENTRY: f64 = 0.35;
+
+/// Colours for the lyric surface. Only the light sidebar needs a dark foreground;
+/// the player always sits over artwork and the dark sidebar keeps its original look.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LyricColors {
+    foreground: Color32,
+    active: Color32,
+    glow: Color32,
+    light_sidebar: bool,
+}
+
+impl LyricColors {
+    fn new(surface: Surface, light: bool, text: Color32, background: Color32, active: Color32, glow: Color32) -> Self {
+        let light_sidebar = surface == Surface::Sidebar && light;
+        if !light_sidebar {
+            return Self { foreground: Color32::WHITE, active, glow, light_sidebar };
+        }
+        // White is the preset default (including #ffffff). Keep other selected colours
+        // when they contrast, and darken only those that would disappear on the panel.
+        let active = if active == Color32::WHITE { text } else { contrast_color(active, text, background) };
+        Self { foreground: text, active, glow, light_sidebar }
+    }
+
+    // Make faint lines legible on light surfaces without making intentionally hidden
+    // lines visible, or changing their transition clocks and endpoints.
+    fn dim_alpha(self, alpha: f32) -> f32 {
+        if self.light_sidebar {
+            let alpha = alpha.clamp(0.0, 1.0);
+            alpha * (2.0 - alpha)
+        } else {
+            alpha
+        }
+    }
+}
+
+/// Darken a low-contrast selected colour towards the theme's text, retaining its tint.
+fn contrast_color(color: Color32, text: Color32, background: Color32) -> Color32 {
+    const MIN_CONTRAST: f32 = 4.5;
+    if contrast_ratio(color, background) >= MIN_CONTRAST {
+        return color;
+    }
+    // Once a colour needs correction, leave enough contrast to distinguish the lit
+    // layer from the dim foreground as well as from the background.
+    const ADJUSTED_CONTRAST: f32 = 6.0;
+    let (mut low, mut high) = (0.0, 1.0);
+    for _ in 0..12 {
+        let mid = (low + high) * 0.5;
+        if contrast_ratio(theme::lerp_color(color, text, mid), background) >= ADJUSTED_CONTRAST {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    theme::lerp_color(color, text, high)
+}
+
+fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let luminance = |c: Color32| {
+        let linear = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * linear(c.r()) + 0.7152 * linear(c.g()) + 0.0722 * linear(c.b())
+    };
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
 
 /// Resolved look for one frame: the extension's defaults, adjusted by the preset.
 #[derive(Clone)]
@@ -140,20 +238,17 @@ struct Cfg {
     font: String,
     weight: Weight,
     size: f32,
-    active: Color32,
+    colors: LyricColors,
     /// Alpha of dim text on the line being sung.
     inactive_alpha: f32,
-    glow: Color32,
-    glow_rem: f32,
     scale: f32,
     active_scale: f32,
     padding: f32,
     target_ratio: f32,
     centered: bool,
     fill: Fill,
-    wave_crest: f32,
-    wave_settle: f32,
-    emphasis: f32,
+    /// `--char-rise-y`: how far a lit glyph rises, in em.
+    rise: f32,
     upcoming_alpha: f32,
     falloff: f32,
     min_alpha: f32,
@@ -166,12 +261,8 @@ struct Cfg {
     bg_em: f32,
     /// `.blyrics-container` inline padding (start, end).
     pad: (f32, f32),
-    /// Word wobble on (themes can set its transforms to identity).
-    wobble: bool,
-    wave_duration: f64,
-    /// `--blyrics-glow-color` alpha on the container and on held words.
+    /// `--lyplus-lyrics-palette` alpha: how bright a glyph's glow is at its peak.
     glow_alpha: f32,
-    long_glow_alpha: f32,
     css: Option<ThemeCss>,
 }
 
@@ -185,7 +276,7 @@ impl Cfg {
         self.active_scale.max(self.css.as_ref().and_then(|c| c.hover_scale).unwrap_or(1.0)).max(1.0)
     }
 
-    fn new(s: &LyricStyle, accent: Color32, width: f32, viewport: f32, centered: bool, scale: f32) -> Self {
+    fn new(s: &LyricStyle, accent: Color32, width: f32, viewport: f32, centered: bool, scale: f32, surface: Surface) -> Self {
         let css = s.css.clone();
         // Font size and rem: a theme's own `--blyrics-font-size` steps in YouTube Music's
         // 10 px rem; otherwise 48 pt scaled by the preset with the extension's proportions.
@@ -219,34 +310,27 @@ impl Cfg {
             Some(_) => Weight::Regular,
             None => s.weight,
         };
-        let wave = css.as_ref().and_then(|c| c.letter_wave).unwrap_or([0.05, 0.02, 0.9, 1.11]);
-        // The app's own look: a letter rises by the preset's lift and stays there, so
-        // the words already sung sit above the line being sung.
-        let (crest, settle) = if css.is_some() { (wave[0], wave[1]) } else { (s.lift.clamp(0.0, 8.0) / size, s.lift.clamp(0.0, 8.0) / size) };
-        let (glow_alpha, long_glow_alpha) = match css.as_ref().and_then(|c| c.glow_alpha) {
-            Some(a) => (a, css.as_ref().and_then(|c| c.long_word_glow_alpha).unwrap_or(a)),
-            // A look without a glow setting of its own glows only as much as its preset asks:
-            // the default look has none.
-            None => (glow, glow),
-        };
+        // A theme's own `--char-rise-y`; the app's look takes it from the preset's lift,
+        // which is what the listener's slider moves.
+        let rise = css.as_ref().and_then(|c| c.letter_wave).map_or(s.lift.clamp(0.0, 8.0) / size, |w| w[0]);
+        // A look without a glow setting of its own glows only as much as its preset asks:
+        // the default look has none.
+        let glow_alpha = css.as_ref().and_then(|c| c.glow_alpha).unwrap_or(glow);
         let pad = css.as_ref().and_then(|c| c.padding_inline).map_or((0.0, 0.0), |p| (p[0] * rem / 10.0, p[1] * rem / 10.0));
         Self {
             font: theme::effective_font(&s.font),
             weight,
             size,
-            active: crate::preset::paint(&s.sung_color, accent),
+            colors: LyricColors::new(surface, theme::light(), theme::text(), theme::bg(), crate::preset::paint(&s.sung_color, accent), crate::preset::paint(&s.glow_color, accent)),
             inactive_alpha: s.active_alpha,
-            glow: crate::preset::paint(&s.glow_color, accent),
-            glow_rem: if css.is_some() { 0.8 } else { 0.8 * (1.0 + glow) },
-            scale: 0.95,
+            // `--am-lyrics-inactive-scale`.
+            scale: 0.98,
             active_scale: s.active_scale.max(1.0),
             padding: rem * 2.0 * (s.line_gap / 0.6).clamp(0.2, 3.0),
-            target_ratio: s.anchor.clamp(0.1, 0.7),
+            target_ratio: surface.target_ratio(s),
             centered,
             fill: s.fill,
-            wave_crest: crest,
-            wave_settle: settle,
-            emphasis: wave[3],
+            rise,
             upcoming_alpha: s.inactive_alpha,
             falloff: s.falloff,
             min_alpha: s.min_alpha,
@@ -256,11 +340,7 @@ impl Cfg {
             rem,
             bg_em: css.as_ref().and_then(|c| c.background_em).unwrap_or(0.75),
             pad,
-            // A theme opts out of the sideways pop; the app's own look doesn't have it.
-            wobble: css.as_ref().is_some_and(|c| !c.no_wobble),
-            wave_duration: wave[2] as f64,
             glow_alpha,
-            long_glow_alpha,
             css,
         }
     }
@@ -284,7 +364,7 @@ impl Cfg {
 
 // ------------------------------------------------------------------ layout
 
-/// One animated word (`.blyrics--word`), relative to its line's content box.
+/// One animated word (`.lyrics-syllable`), relative to its line's content box.
 #[derive(Clone)]
 struct Word {
     text: String,
@@ -294,24 +374,26 @@ struct Word {
     /// Zero-duration (line-synced) word: fades in instead of sweeping.
     line_synced: bool,
     bg: bool,
-    /// Held longer than `LONG_WORD`: letters swell as they crest.
-    long: bool,
+    /// `--wipe-gradient-width` in em: the wipe's soft edge.
+    feather: f32,
+    /// A script whose characters stand alone and mean something apart (Han, kana, Hangul).
+    cjk: bool,
+    /// The pre-wipe: when its feather starts creeping in, and for how long (0 = none).
+    pre_start: f64,
+    pre_dur: f64,
     pos: Pos2,
     w: f32,
     h: f32,
     group: usize,
-    letters: bool,
     /// Right-to-left letters: lit from the right.
     rtl: bool,
 }
 
-/// A word group (`.blyrics-word-group`): what wobbles, driven by its first word.
+/// A word (`.lyrics-word`): the timed pieces that share one glyph clock.
 #[derive(Clone)]
 struct Group {
     first: usize,
     words: std::ops::Range<usize>,
-    /// Inline (long) groups can't be transformed.
-    wobbles: bool,
 }
 
 #[derive(Clone)]
@@ -431,6 +513,12 @@ fn joining_script(s: &str) -> bool {
     s.chars().any(|c| matches!(c as u32, 0x0600..=0x06FF | 0x0700..=0x074F | 0x0750..=0x077F | 0x0780..=0x07BF | 0x0840..=0x085F | 0x08A0..=0x08FF | 0x1800..=0x18AF | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF))
 }
 
+/// The extension's `char-rise` class: scripts whose every character is a word-sized unit,
+/// which is what picks the tighter wipe, the spring rise and the missing glow.
+fn cjk_script(s: &str) -> bool {
+    s.chars().any(|c| matches!(c as u32, 0x2E80..=0x303F | 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0x20000..=0x2FA1F))
+}
+
 struct Flow {
     words: Vec<Word>,
     groups: Vec<Group>,
@@ -487,9 +575,8 @@ fn flow(fonts: &mut FontsView<'_>, toks: Vec<Tok>, font: &FontId, max_w: f32, li
             Item::Space => pending_space = !words.is_empty(),
             Item::Group(toks) => {
                 let text: String = toks.iter().map(|t| t.text.as_str()).collect();
-                let long = text.chars().count() > LONG_GROUP_CHARS;
-                let rtl_group = crate::bidi::has_rtl(&text);
-                let letters = !joining_script(&text) && !rtl_group;
+                let long = text.chars().count() >= LONG_GROUP_CHARS;
+                let cjk = cjk_script(&text);
                 let sizes: Vec<Vec2> = toks.iter().map(|t| text_size(fonts, &t.text, font)).collect();
                 let w: f32 = sizes.iter().map(|s| s.x).sum();
                 let sp = if pending_space { space_w } else { 0.0 };
@@ -512,6 +599,13 @@ fn flow(fonts: &mut FontsView<'_>, toks: Vec<Tok>, font: &FontId, max_w: f32, li
                         x = 0.0;
                         rows.push((words.len(), 0.0));
                     }
+                    // `applyWipeShape`: the edge widens with the word, up to a fifth of an em.
+                    let glyphs = t.text.chars().filter(|c| !c.is_whitespace()).count() as f32;
+                    let feather = if cjk {
+                        FEATHER_CJK_EM
+                    } else {
+                        FEATHER_EM + ((glyphs - 6.0) / FEATHER_LONG_FROM).clamp(0.0, 1.0) * FEATHER_EXTRA_EM
+                    };
                     words.push(Word {
                         text: t.text.clone(),
                         font: font.clone(),
@@ -519,18 +613,20 @@ fn flow(fonts: &mut FontsView<'_>, toks: Vec<Tok>, font: &FontId, max_w: f32, li
                         dur: t.dur,
                         line_synced: t.dur <= 0.0,
                         bg: t.bg,
-                        long: t.dur > LONG_WORD,
+                        feather,
+                        cjk,
+                        pre_start: 0.0,
+                        pre_dur: 0.0,
                         pos: pos2(x, row as f32 * line_h + (line_h - size.y) * 0.5),
                         w: size.x,
                         h: size.y,
                         group: gi,
-                        letters,
                         rtl: crate::bidi::has_rtl(&t.text),
                     });
                     x += size.x;
                     rows[row].1 = x;
                 }
-                groups.push(Group { first, words: first..words.len(), wobbles: !long });
+                groups.push(Group { first, words: first..words.len() });
             }
         }
     }
@@ -570,6 +666,29 @@ fn flow(fonts: &mut FontsView<'_>, toks: Vec<Tok>, font: &FontId, max_w: f32, li
                 w.pos.x += shift.max(0.0);
             }
         }
+    }
+    // `maybePreWipeNextWord`: when a word follows another with no breath between them, its
+    // feather starts creeping in early, so the highlight hands over without a gap.
+    for i in 1..words.len() {
+        let (prev, next) = (&words[i - 1], &words[i]);
+        if next.group == prev.group || next.line_synced || prev.line_synced || next.bg || prev.bg || next.dur <= 0.0 {
+            continue;
+        }
+        let prev_end = prev.start + prev.dur.max(0.0);
+        let gap = next.start - prev_end;
+        if !(0.0..=PRE_WIPE_GAP).contains(&gap) {
+            continue;
+        }
+        let n = next.text.chars().filter(|c| !c.is_whitespace()).count() as f64;
+        // `getWordPreWipeDuration`: 64 ms plus 9 ms a glyph, and the handoff is never
+        // more than 100 ms behind the previous word.
+        let pre_dur = (0.064 + 0.009 * n).clamp(PRE_WIPE_MIN, PRE_WIPE_MAX);
+        let (pre_dur, pre_start) = (pre_dur, next.start - pre_dur);
+        let pre_start = pre_start.max(prev_end - PRE_WIPE_HANDOFF);
+        // The write comes last, after every read of the pair.
+        let w = &mut words[i];
+        w.pre_dur = pre_dur;
+        w.pre_start = pre_start;
     }
     let width = rows.iter().map(|r| r.1).fold(0.0, f32::max);
     let height = if words.is_empty() { 0.0 } else { (row + 1) as f32 * line_h };
@@ -784,6 +903,23 @@ struct LineState {
     exit_t: f64,
 }
 
+/// A lyrics surface has its own view state, independent of horizontal alignment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Surface {
+    Player,
+    Sidebar,
+}
+
+impl Surface {
+    fn target_ratio(self, style: &LyricStyle) -> f32 {
+        match self {
+            Self::Player => style.anchor.clamp(0.1, 0.7),
+            // Leave room for the edge fade, but keep the current line near the top.
+            Self::Sidebar => 0.12,
+        }
+    }
+}
+
 /// The lyrics view's state between frames.
 #[derive(Default)]
 pub struct View {
@@ -823,6 +959,7 @@ pub struct Frame<'a> {
     pub style: &'a LyricStyle,
     pub accent: Color32,
     pub centered: bool,
+    pub surface: Surface,
     /// The listener's lyrics text size, a multiple of the theme's.
     pub scale: f32,
 }
@@ -837,7 +974,7 @@ pub struct Out {
 
 impl View {
     pub fn reset(&mut self) {
-        *self = Self { glow: std::mem::take(&mut self.glow), ..Default::default() };
+        *self = Self { glow: std::mem::take(&mut self.glow), shown_pass: self.shown_pass, ..Default::default() };
     }
 
     /// Called every frame: once the view isn't drawn (another tab or page), its glows,
@@ -867,9 +1004,19 @@ impl View {
         let rect = f.rect;
         let ctx = ui.ctx().clone();
         self.shown_pass = ctx.cumulative_pass_nr();
-        let cfg = Cfg::new(f.style, f.accent, rect.width(), ctx.content_rect().width(), f.centered, f.scale);
-        let layout_key = hash((f.key, rect.width().round() as i32, cfg.size.to_bits(), cfg.padding.to_bits(), cfg.max_scale().to_bits(), cfg.centered, &cfg.font, cfg.weight as u8));
-        if self.layout.as_ref().is_none_or(|l| l.key != layout_key) {
+        let mut cfg = Cfg::new(f.style, f.accent, rect.width(), ctx.content_rect().width(), f.centered, f.scale, f.surface);
+        if f.surface == Surface::Sidebar {
+            // On short windows keep the active text below the renderer's top-edge fade.
+            let fade = (cfg.size * 1.6).min(rect.height() * 0.15).max(1.0);
+            let visible_center = (fade + cfg.size * 0.5) / rect.height().max(1.0);
+            cfg.target_ratio = cfg.target_ratio.max(visible_center.min(0.7));
+        }
+        // Padding depends on the anchor and, in the drawer, the viewport height too.
+        // Keep the player's existing resize behavior while updating the drawer on resize.
+        let height = if f.surface == Surface::Sidebar { rect.height().round() as i32 } else { 0 };
+        let layout_key = hash((f.key, rect.width().round() as i32, height, cfg.size.to_bits(), cfg.padding.to_bits(), cfg.max_scale().to_bits(), cfg.target_ratio.to_bits(), cfg.centered, &cfg.font, cfg.weight as u8));
+        let layout_changed = self.layout.as_ref().is_none_or(|l| l.key != layout_key);
+        if layout_changed {
             self.relayout(ui, &cfg, &f, layout_key, rect);
         }
         let layout = self.layout.as_ref().unwrap();
@@ -903,7 +1050,7 @@ impl View {
             } else if !selected && jumped {
                 st.exit = None;
             }
-            if st.exit.is_some_and(|e| f.now - e > FADE_OUT.max(SCALE_DURATION)) {
+            if st.exit.is_some_and(|e| f.now - e > FADE_OUT.max(SCALE_OUT)) {
                 st.exit = None;
             }
             animating |= st.exit.is_some();
@@ -911,11 +1058,16 @@ impl View {
 
         // ---- scrolling
         let view_h = rect.height();
-        let scroll_time = t + SCROLL_OFFSET;
+        // The view runs ahead of the singing by the gap the line being sung leaves before
+        // the next one starts, held between 350 and 500 ms.
+        let sung = (0..lines_n).rev().find(|&i| t >= layout.blocks[i].start && t < layout.blocks[i].start + layout.blocks[i].dur.max(0.001));
+        let ahead = sung
+            .map_or(SCROLL_AHEAD_MAX, |i| layout.blocks.get(i + 1).map_or(SCROLL_AHEAD_MAX, |n| n.start - (layout.blocks[i].start + layout.blocks[i].dur)));
+        let scroll_time = t + ahead.clamp(SCROLL_AHEAD_MIN, SCROLL_AHEAD_MAX);
         let user = f.now < self.user_until;
         let mut active: Vec<usize> = Vec::new();
         // Leaving reader scrolling (the button, or the timeout) returns to the current line now.
-        let mut new_lyric = jumped || (self.was_user && !user);
+        let mut new_lyric = jumped || (self.was_user && !user) || (f.surface == Surface::Sidebar && layout_changed);
         self.was_user = user;
         for i in 0..lines_n {
             let b = &layout.blocks[i];
@@ -958,6 +1110,9 @@ impl View {
         }
         let pos = |i: usize| layout.pad_top + layout.blocks[i].top;
         let max_scroll = (layout.content_h - view_h).max(0.0);
+        if f.surface == Surface::Sidebar && layout_changed {
+            self.scroll_top = self.scroll_top.clamp(0.0, max_scroll);
+        }
         if !user && (new_lyric || !self.scroll_set) && lines_n > 0 {
             if active.is_empty() {
                 active.push(0);
@@ -981,6 +1136,10 @@ impl View {
             top = top.min(pos(lastl)).min(pos(first));
             top = top.max(pos(anchor) + h(anchor) - view_h);
             top = top.min(pos(anchor));
+            if f.surface == Surface::Sidebar && h(anchor) <= view_h - line_h {
+                let fade = (cfg.size * 1.6).min(view_h * 0.15).max(1.0);
+                top = top.min(pos(anchor) - fade);
+            }
             if let Some(y) = sung_y(anchor) {
                 // Keep the row being sung, and the one after it, in view.
                 top = top.max(pos(anchor) + y + line_h * 2.0 - view_h);
@@ -989,7 +1148,8 @@ impl View {
                 top = (pos(c) + h(c) / 2.0 - offset).min(pos(ls));
             }
             let top = top.clamp(0.0, max_scroll);
-            if !self.scroll_set {
+            if !self.scroll_set || (f.surface == Surface::Sidebar && layout_changed) {
+                self.scrolls.clear();
                 self.scroll_top = top;
                 self.scroll_set = true;
             } else if (top - self.scroll_top).abs() > 2.0 {
@@ -1035,9 +1195,11 @@ impl View {
             let mut dy = 0.0;
             for a in &self.scrolls {
                 let rel = i as isize - a.active as isize;
-                let d = scroll_duration(rel, a.delta);
-                let p = ((f.now - a.start) / d).clamp(0.0, 1.0) as f32;
-                dy += a.delta * (1.0 - SCROLL_EASE.at(p));
+                // `--scroll-duration` for every line, with the cascade as a wait rather than
+                // a slower move: a line four away starts a fifth of a second into the run.
+                let wait = scroll_cascade(rel);
+                let p = ((f.now - a.start - wait) / SCROLL_DUR).clamp(0.0, 1.0);
+                dy += a.delta * (1.0 - spring_step(p * SCROLL_DUR, SCROLL_SPRING.0, SCROLL_SPRING.1) as f32);
             }
             if let Some(shifts) = self.shifts.get(i) {
                 for s in shifts {
@@ -1058,7 +1220,7 @@ impl View {
                 let o = transform_origin(block_rect, b.align, content.x);
                 let g = ctx.fonts_mut(|fv| fv.layout(text.clone(), font.clone(), Color32::WHITE, line_w - cfg.size * 0.5));
                 let xf = Xf { origin: o, scale: cfg.scale, content };
-                paint_galley(&painter, &g, pos2(0.0, cfg.padding), &xf, theme::with_alpha(Color32::WHITE, a), atlas);
+                paint_galley(&painter, &g, pos2(0.0, cfg.padding), &xf, theme::with_alpha(cfg.colors.foreground, cfg.colors.dim_alpha(a)), atlas);
                 continue;
             }
             let li = b.line.unwrap();
@@ -1098,40 +1260,50 @@ impl View {
                 let rel = active_line.map_or(1, |a| i as isize - a as isize);
                 let past = rel < 0;
                 let dist = rel.unsigned_abs() as f32;
-                let upcoming = (cfg.upcoming_alpha - dist.min(6.0) * cfg.falloff).max(cfg.min_alpha.min(cfg.upcoming_alpha));
-                let reveal = theme::anim_bool(&ctx, "lyr-reveal", user, 0.3);
-                let dim = if sung_now || rel == 0 {
+                // The row beside the one being sung is as bright as that one; the steps
+                // begin after it, and stop at the preset's floor.
+                let upcoming = (cfg.upcoming_alpha - (dist - 1.0).max(0.0).min(6.0) * cfg.falloff).max(cfg.min_alpha.min(cfg.upcoming_alpha));
+                let reveal_id = if f.surface == Surface::Sidebar { "sidebar-lyr-reveal" } else { "lyr-reveal" };
+                let reveal = theme::anim_bool(&ctx, reveal_id, user, 0.3);
+                let dim = if st.selected || rel == 0 {
                     cfg.inactive_alpha
                 } else if past {
-                    lerp(cfg.past_alpha.unwrap_or(upcoming), upcoming, reveal)
+                    // The lines already sung stay above the current one, dimmed, unless the
+                    // listener turned them off in Settings.
+                    let shown = ctx.data(|d| d.get_temp::<bool>(egui::Id::unique("lyrics-past"))).unwrap_or(true);
+                    lerp(if shown { cfg.past_alpha.unwrap_or(upcoming) } else { 0.0 }, upcoming, reveal)
                 } else {
                     upcoming
                 };
-                let dim = theme::anim(&ctx, ("lyr-dim", f.key, i), dim, 0.3);
+                // `transition: opacity 0.7 s ease, filter 0.7 s ease` on a line's row.
+                let dim = theme::anim(&ctx, ("lyr-dim", f.key, i), dim, 0.7);
                 let blur_on = match cfg.blur_scope {
                     BlurScope::All => true,
                     BlurScope::Past => past,
                     BlurScope::Upcoming => !past || reveal > 0.0,
                 };
-                let target = if cfg.blur > 0.0 && blur_on && !sung_now && rel != 0 { (cfg.blur * (1.0 + 0.35 * (dist - 1.0).clamp(0.0, 3.0))).min(9.0) } else { 0.0 };
+                // `.pre-active`: the line about to be sung is sharp and unblurred already.
+                let target = if cfg.blur > 0.0 && blur_on && !st.selected && rel != 0 { (cfg.blur * (1.0 + 0.35 * (dist - 1.0).clamp(0.0, 3.0))).min(9.0) } else { 0.0 };
                 let s = &mut self.states[i];
-                s.blur.set(target, f.now, 0.35, 0.0);
+                s.blur.set(target, f.now, 0.7, 0.0);
                 animating |= s.blur.moving(f.now);
                 (dim, 1.0, s.blur.value(f.now))
             };
+            let dim = cfg.colors.dim_alpha(dim);
 
-            // Line scale: 0.95 at rest, 1 while sung (enter at its start, exit when it ends);
-            // a theme's hover scale on lines not being sung.
+            // Line scale: `--am-lyrics-inactive-scale` at rest, 1 while sung (enter over
+            // 0.5 s at its start, settle back over 0.4 s when it ends); a theme's hover
+            // scale on lines not being sung.
             let mut scale = cfg.scale;
             if st.selected && t >= b.start {
-                scale = lerp(cfg.scale, cfg.active_scale, EASE.at(((t - b.start) / SCALE_DURATION) as f32));
+                scale = lerp(cfg.scale, cfg.active_scale, EASE.at(((t - b.start) / SCALE_IN) as f32));
             } else if let Some(e) = st.exit {
-                scale = lerp(cfg.active_scale, cfg.scale, EASE.at(((f.now - e) / SCALE_DURATION) as f32));
+                scale = lerp(cfg.active_scale, cfg.scale, SETTLE.at(((f.now - e) / SCALE_OUT) as f32));
             } else if let Some(h) = cfg.css.as_ref().and_then(|c| c.hover_scale) {
                 let k = theme::anim_bool(&ctx, ("lyr-hover", f.key, i), hovered, 0.3);
                 scale = lerp(cfg.scale, h, EASE.at(k));
             }
-            if st.selected && t >= b.start && t < b.start + SCALE_DURATION {
+            if st.selected && t >= b.start && t < b.start + SCALE_IN {
                 animating = true;
             }
             let origin = transform_origin(block_rect, b.align, content.x);
@@ -1144,7 +1316,7 @@ impl View {
             } else {
                 0.0
             };
-            let text_alpha = 0.6 * lerp(dim, 1.0, text_lit);
+            let text_alpha = (if cfg.colors.light_sidebar { 0.8 } else { 0.6 }) * lerp(dim, 1.0, text_lit);
             // The pill belongs to its line: it fades out with the line's text.
             let fade = lerp(dim, 1.0, text_lit);
             if b.instrumental {
@@ -1179,7 +1351,7 @@ impl View {
                     // Rendered at the line's scale; snapped so it lands 1:1 on screen pixels.
                     let to = xf.rect(rr);
                     let snapped = (to.min.to_vec2() * ppp).round() / ppp;
-                    painter.image(tex, to.translate(snapped - to.min.to_vec2()), uv, theme::with_alpha(Color32::WHITE, opacity));
+                    painter.image(tex, to.translate(snapped - to.min.to_vec2()), uv, theme::with_alpha(cfg.colors.foreground, opacity));
                 }
                 animating |= st.exit.is_some();
             } else {
@@ -1191,7 +1363,7 @@ impl View {
                     if d.pill {
                         let r = dxf.rect(d.rect);
                         let radius = (cfg.rem() * scale).min(255.0) as u8;
-                        painter.rect(r, radius, theme::with_alpha(Color32::WHITE, 0.05 * a * fade), egui::Stroke::new(1.0, theme::with_alpha(Color32::WHITE, 0.1 * a * fade)), egui::StrokeKind::Inside);
+                        painter.rect(r, radius, theme::with_alpha(cfg.colors.foreground, 0.05 * a * fade), egui::Stroke::new(1.0, theme::with_alpha(cfg.colors.foreground, 0.1 * a * fade)), egui::StrokeKind::Inside);
                     }
                     match &d.body {
                         DecoBody::Timed { words, groups } => {
@@ -1201,7 +1373,7 @@ impl View {
                             let wrap = d.rect.width() + 1.0;
                             let g = ctx.fonts_mut(|fv| fv.layout(text.clone(), font.clone(), Color32::WHITE, wrap));
                             let pad = if d.pill { vec2(cfg.rem() * 0.75 + 1.0, cfg.rem() * 0.25 + 1.0) } else { Vec2::ZERO };
-                            paint_galley(&painter, &g, d.rect.min + pad, &dxf, theme::with_alpha(Color32::WHITE, text_alpha * a), atlas);
+                            paint_galley(&painter, &g, d.rect.min + pad, &dxf, theme::with_alpha(cfg.colors.foreground, text_alpha * a), atlas);
                         }
                     }
                 }
@@ -1276,7 +1448,8 @@ impl View {
         let view_h = rect.height();
         // `computeScrollPadding`
         let first_h = blocks.first().map_or(0.0, |b| b.height);
-        let pad_top = (view_h * cfg.target_ratio - first_h / 2.0).max(0.0);
+        let edge = if f.surface == Surface::Sidebar { (cfg.size * 1.6).min(view_h * 0.15).max(1.0) } else { 0.0 };
+        let pad_top = (view_h * cfg.target_ratio - first_h / 2.0).max(edge);
         let last_centre = blocks.iter().rev().find(|b| b.line.is_some()).map(|b| b.top + b.height / 2.0);
         let last_h = blocks.iter().rev().find(|b| b.line.is_some()).map_or(0.0, |b| b.height);
         let content = y;
@@ -1298,7 +1471,7 @@ impl View {
             }
         } else {
             let glow = std::mem::take(&mut self.glow);
-            *self = Self { glow, ..Default::default() };
+            *self = Self { glow, shown_pass: self.shown_pass, ..Default::default() };
             self.states = vec![LineState::default(); blocks.len()];
             self.shifts = vec![Vec::new(); blocks.len()];
         }
@@ -1319,20 +1492,20 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
-/// Duration of one line's part in a scroll, by its distance from the active line
-/// (`LINE_SCROLL_AFTER_FUNCTION` and the `above` variant).
-fn scroll_duration(rel: isize, delta: f32) -> f64 {
-    let up = delta < 0.0;
-    let above = (rel < 0 && !up) || (rel > 0 && up);
-    let i = rel.unsigned_abs() as f64;
-    if above { (750.0 + i.min(6.0) * 20.0) / 1000.0 } else { (750.0 + (i + 2.0).ln() * 80.0 + (i + 1.0) * 20.0) / 1000.0 }
+/// How long a line waits before it moves in a scroll. The move itself takes the same
+/// `--scroll-duration` whatever the distance; the cascade holds each line further from
+/// the active one a little longer, up to four of them.
+fn scroll_cascade(rel: isize) -> f64 {
+    rel.unsigned_abs().min(4) as f64 * SCROLL_CASCADE
 }
 
+/// `transform-origin: left bottom`: a line grows from its baseline, so scaling it never
+/// lifts the text out of the row it sits in.
 fn transform_origin(block: Rect, align: Align, content_left: f32) -> Pos2 {
     match align {
-        Align::Left => pos2(block.left(), block.center().y),
-        Align::Right => pos2(block.right(), block.center().y),
-        Align::Center => pos2(block.center().x.max(content_left), block.center().y),
+        Align::Left => pos2(block.left(), block.bottom()),
+        Align::Right => pos2(block.right(), block.bottom()),
+        Align::Center => pos2(block.center().x.max(content_left), block.bottom()),
     }
 }
 
@@ -1500,7 +1673,13 @@ impl LitState {
         if self.exit.is_some() {
             return true;
         }
-        self.live && b.words.iter().any(|w| t >= w.start - 0.5 && t < w.start + w.dur.max(0.0) * SWIPE_DURATION + GLOW_MIN.max(w.dur * GLOW_RATIO) + 1.0)
+        // The pre-wipe leads, the wipe runs across the word, and the glyphs are still
+        // breathing (and glowing) for their own span afterwards.
+        self.live && b.words.iter().enumerate().any(|(wi, w)| {
+            let from = if w.pre_dur > 0.0 { w.pre_start } else { w.start };
+            let to = w.start + w.dur.max(0.0) + clock(&b.words, &b.groups, wi).plan().span + GLOW_TAIL;
+            t >= from && t < to
+        })
     }
 }
 
@@ -1508,136 +1687,205 @@ impl LitState {
 struct WordLook {
     /// Lit layer opacity.
     opacity: f32,
-    /// Gradient start/end, as fractions of the word (or letter-index space).
+    /// The wipe's gradient, as fractions of the word: fully lit at `start`, gone at `end`.
     start: f32,
     end: f32,
     /// Glow radius in points (0 = none).
     glow: f32,
-    /// Alpha of this word's `--blyrics-glow-color`.
+    /// Alpha of the glow this frame.
     glow_alpha: f32,
 }
 
-fn word_look(w: &Word, lit: &LitState, cfg: &Cfg) -> WordLook {
-    let glow_alpha = if w.long { cfg.long_glow_alpha } else { cfg.glow_alpha };
-    let none = WordLook { opacity: 0.0, start: SWIPE_START.0, end: SWIPE_END.0, glow: 0.0, glow_alpha };
-    let full = |opacity: f32| WordLook { opacity, start: SWIPE_START.1, end: SWIPE_END.1, glow: 0.0, glow_alpha };
+/// A word the wipe has run through: its gradient sits past the right edge.
+const LIT: (f32, f32) = (1.0, 2.0);
+
+/// `springProgress`: the extension's critically damped step response.
+fn spring_progress(t: f64, response: f64) -> f64 {
+    if t <= 0.0 {
+        return 0.0;
+    }
+    let phase = std::f64::consts::TAU * t / response.max(0.001);
+    1.0 - (1.0 + phase) * (-phase).exp()
+}
+
+/// `sampleSpring`: a mass on a spring, from rest to 1 — `w0` its angular frequency and
+/// `zeta` the share of critical damping it carries. A hair under 1 arrives without a bob,
+/// which is what the view's scroll and a word's rise both use.
+fn spring_step(t: f64, w0: f64, zeta: f64) -> f64 {
+    if t <= 0.0 {
+        return 0.0;
+    }
+    let wd = w0 * (1.0 - zeta * zeta).max(1e-6).sqrt();
+    1.0 - (-zeta * w0 * t).exp() * ((wd * t).cos() + (zeta * w0 / wd) * (wd * t).sin())
+}
+
+/// `@keyframes char-glow` over one glyph's span: 0, 0.8 at 15 %, 1 at 30 %, 0.3 at 60 %, 0.
+fn glow_env(t: f64, span: f64) -> f32 {
+    if t <= 0.0 || span <= 0.0 {
+        return 0.0;
+    }
+    let p = (t / span).min(1.0) as f32;
+    let at = |a: f32, b: f32, from: f32, to: f32| from + (to - from) * ((p - a) / (b - a));
+    if p <= 0.15 {
+        at(0.0, 0.15, 0.0, 0.8)
+    } else if p <= 0.30 {
+        at(0.15, 0.30, 0.8, 1.0)
+    } else if p <= 0.60 {
+        at(0.30, 0.60, 1.0, 0.3)
+    } else {
+        at(0.60, 1.0, 0.3, 0.0)
+    }
+}
+
+/// am-lyrics' motion clock for one word: the whole of it where the script splits into
+/// glyphs (`getCachedVirtualWordCharSpans`), each timed piece where it doesn't.
+#[derive(Clone, Copy)]
+struct Clock {
+    start: f64,
+    dur: f64,
+    chars: usize,
+    /// Where this piece's first glyph sits in the shared clock.
+    first: usize,
+    cjk: bool,
+}
+
+/// `updateCharacterMotion`'s schedule for one word.
+#[derive(Clone, Copy)]
+struct CharPlan {
+    /// Between the starts of successive glyphs.
+    delay: f64,
+    /// Each glyph's own animation.
+    span: f64,
+    /// How long a glyph stays at the top of its fan.
+    hold: f64,
+    response: f64,
+    /// How far a word fans and swells: nothing under a second, all of it over two.
+    emphasis: f64,
+    /// `--char-glow-max`: the shadow's own ceiling, which reaches it twice as fast as
+    /// the fan does — nothing under a second, 0.45 by a second and a half.
+    glow: f64,
+}
+
+impl Clock {
+    fn plan(&self) -> CharPlan {
+        let n = self.chars.max(1) as f64;
+        let d = self.dur.max(0.001);
+        let stagger = (d / n) * if self.cjk { 0.4 } else { 0.35 };
+        let delay = if self.cjk { stagger.min(0.05).min(0.2 / n) } else { stagger.min(0.35) };
+        let hold = 2.0 * d / n;
+        let response = d.min(3.0);
+        CharPlan {
+            delay,
+            span: (hold + response * 2.0).max(if self.cjk { 3.0 } else { 0.0 }),
+            hold,
+            response,
+            // `getCharacterFrames`: `emphasis = cjk ? 0 : clamp(duration - 1, 0, 1)`; am-lyrics
+            // has no length exception.
+            emphasis: if self.cjk { 0.0 } else { (d - 1.0).clamp(0.0, 1.0) },
+            glow: if self.cjk { 0.0 } else { GLOW_MAX * ((d - 1.0) / 0.5).clamp(0.0, 1.0) },
+        }
+    }
+}
+
+/// The clock one piece of a laid-out line moves to.
+fn clock(words: &[Word], groups: &[Group], wi: usize) -> Clock {
+    let glyphs = |w: &Word| w.text.chars().filter(|c| !c.is_whitespace()).count();
+    let w = &words[wi];
+    // CJK has no reliable word boundary, so each piece keeps its own clock.
+    if w.cjk {
+        return Clock { start: w.start, dur: w.dur, chars: glyphs(w), first: 0, cjk: true };
+    }
+    let gr = &groups[w.group];
+    let run = &words[gr.words.clone()];
+    let start = run.iter().map(|x| x.start).fold(f64::INFINITY, f64::min);
+    let end = run.iter().map(|x| x.start + x.dur.max(0.0)).fold(f64::NEG_INFINITY, f64::max);
+    Clock {
+        start,
+        dur: (end - start).max(0.001),
+        chars: run.iter().map(glyphs).sum(),
+        first: run[..wi - gr.first].iter().map(glyphs).sum(),
+        cjk: false,
+    }
+}
+
+/// Where one glyph of the word is this frame: (rise in em, sideways in em, scale).
+fn char_pose(p: &CharPlan, i: usize, count: usize, t: f64, rise: f32) -> (f32, f32, f32) {
+    let tl = t - (i as f64 + 1.0) * p.delay;
+    if tl <= 0.0 {
+        return (0.0, 0.0, 1.0);
+    }
+    // `getCharacterFrames`: the glyph rises on `sampleSpring(-3px, ..., response)`, and
+    // rides the fan's worth of that same lift.
+    let r = 0.92 * rise as f64 * spring_progress(tl, p.response.min(LETTER_RESPONSE_MAX));
+    let e = p.emphasis * spring_progress(tl, p.response) * (1.0 - spring_progress(tl - p.hold, p.response));
+    let mid = (count.saturating_sub(1)) as f64 * 0.5;
+    ((r + FAN_LIFT_EM as f64 * e) as f32, ((i as f64 - mid) * FAN_SPREAD_EM as f64 * e) as f32, (1.0 + 0.1 * e) as f32)
+}
+
+/// Where one glyph of the word is this frame: (rise in em, sideways in em, scale). Every
+/// glyph has a clock of its own, the way am-lyrics' `.character` spans do.
+fn glyph_pose(_cjk: bool, plan: &CharPlan, i: usize, count: usize, t: f64, rise: f32) -> (f32, f32, f32) {
+    char_pose(plan, i, count, t, rise)
+}
+
+fn word_look(w: &Word, lit: &LitState, cfg: &Cfg, c: &Clock) -> WordLook {
+    let none = WordLook { opacity: 0.0, start: LIT.0, end: LIT.1, glow: 0.0, glow_alpha: 0.0 };
     if let Some((since, exit_t)) = lit.exit {
         // Words already sung fade back over 0.5 s; the rest were reset.
-        if exit_t < w.start {
-            return none;
-        }
-        return full(1.0 - EASE.at(since / FADE_OUT as f32));
+        return if exit_t < w.start {
+            none
+        } else {
+            WordLook { opacity: 1.0 - EASE.at(since / FADE_OUT as f32), ..none }
+        };
     }
     if !lit.live {
         return none;
     }
     let e = lit.t - w.start;
-    if e < 0.0 {
-        return none;
-    }
     // `resolveLineGlowSuppression`: a glow colour too faint to see isn't animated at all.
-    let glow_rem = if glow_alpha < GLOW_INVISIBLE { 0.0 } else { cfg.glow_rem * cfg.rem() };
-    match lit.fill {
-        Fill::Line | Fill::Word => {
-            // Word: a colour flip with a short transition (`data-word-state`);
-            // Line: the line-synced fade.
-            let d = if lit.fill == Fill::Word { 0.18 } else { FADE_IN };
-            let p = EASE.at((e / d) as f32);
-            WordLook { glow: glow_radius(e, GLOW_MIN, glow_rem), ..full(p) }
+    let base = if cfg.glow_alpha < GLOW_INVISIBLE { 0.0 } else { cfg.glow_alpha };
+    if lit.fill != Fill::Sweep || w.line_synced {
+        // Word: a colour flip (`data-word-state`); Line and the line-synced fade: 0.33 s.
+        let d = if lit.fill == Fill::Word { 0.18 } else { FADE_IN };
+        let fade = (1.0 - (e / GLOW_TAIL).clamp(0.0, 1.0)) as f32;
+        return WordLook { opacity: EASE.at(e.max(0.0) as f32 / d as f32), start: LIT.0, end: LIT.1, glow: GLOW_EM * w.font.size, glow_alpha: base * fade };
+    }
+    // `.char-motion[data-glow]::after` shadows with `var(--lyplus-text-primary)` at full
+    // strength: the wipe's glow is the lit colour itself, not the preset's palette alpha,
+    // so only the colour's own faintness can suppress it.
+    let text_glow = if cfg.colors.glow.a() < 4 { 0.0 } else { 1.0 };
+    // `wipe`: the edge runs straight across the word and its feather, over its duration.
+    let feather = (w.feather * w.font.size) as f64;
+    let wide = w.w.max(1.0) as f64;
+    let s = if e < 0.0 {
+        if w.pre_dur <= 0.0 {
+            return none;
         }
-        Fill::Sweep if w.line_synced => {
-            let p = EASE.at((e / FADE_IN) as f32);
-            WordLook { glow: glow_radius(e, GLOW_MIN, glow_rem), ..full(p) }
-        }
-        Fill::Sweep => {
-            let d = w.dur.max(0.0);
-            let sd = d * SWIPE_DURATION;
-            let p = if sd <= 0.0 { 1.0 } else { ((e + d * SWIPE_LEAD) / sd).clamp(0.0, 1.0) as f32 };
-            // A word held past the beat glows more and more as it goes; the rest decay
-            // as the extension's do.
-            let glow = if w.long { held_glow(e, d, glow_rem) } else { glow_radius(e, (d * GLOW_RATIO).max(GLOW_MIN), glow_rem) };
-            WordLook { opacity: 1.0, start: lerp(SWIPE_START.0, SWIPE_START.1, p), end: lerp(SWIPE_END.0, SWIPE_END.1, p), glow, glow_alpha }
-        }
-    }
-}
-
-/// The swell, hold and release of a held word's glow, in points.
-fn held_glow(e: f64, dur: f64, from: f32) -> f32 {
-    if e < 0.0 || from <= 0.0 {
-        return 0.0;
-    }
-    let from = from as f64;
-    let top = from * GLOW_SWELL;
-    if e <= dur {
-        let rise = dur.min(HOLD_RISE);
-        return (from + (top - from) * EASE.at((e / rise) as f32) as f64) as f32;
-    }
-    let x = ((e - dur) / GLOW_RELEASE).min(1.0) as f32;
-    (top * (1.0 - EASE.at(x) as f64)) as f32
-}
-
-/// `drop-shadow` radius: 0.8rem → 0 with `ease`, then gone.
-fn glow_radius(e: f64, dur: f64, from: f32) -> f32 {
-    if e < 0.0 || e >= dur {
-        return 0.0;
-    }
-    from * (1.0 - EASE.at((e / dur) as f32))
-}
-
-/// `planLetterWave` on the default swipe ramp: (delay, duration) per letter, seconds.
-fn letter_waves(n: usize, d: f64, float: f64) -> Vec<(f64, f64)> {
-    let sd = d * SWIPE_DURATION;
-    let lead = d * SWIPE_LEAD;
-    let rise = float * LETTER_WAVE_CREST as f64;
-    (0..n)
-        .map(|i| {
-            if sd <= 0.0 {
-                return (0.0, float);
-            }
-            let (sf, st) = (SWIPE_START.0 as f64, SWIPE_START.1 as f64);
-            let (ef, et) = (SWIPE_END.0 as f64, SWIPE_END.1 as f64);
-            let begin = (sd * (i as f64 / n as f64 - ef) / (et - ef)).clamp(0.0, sd);
-            let finish = (sd * ((i + 1) as f64 / n as f64 - sf) / (st - sf)).clamp(0.0, sd);
-            let dur = (finish - begin).max(0.001);
-            let touched = begin - lead;
-            let lit = touched + dur;
-            if lit - rise > touched { (touched, (lit - touched) / LETTER_WAVE_CREST as f64) } else { (lit - rise, float) }
-        })
-        .collect()
-}
-
-/// A letter's float this frame: (lift in em, scale).
-fn letter_float(e: f64, wave: (f64, f64), long: bool, cfg: &Cfg) -> (f32, f32) {
-    let p = (e - wave.0) / wave.1;
-    if p < 0.0 {
-        return (0.0, 1.0);
-    }
-    let p = p.min(1.0) as f32;
-    let peak = if long { cfg.emphasis } else { 1.0 };
-    if p < LETTER_WAVE_CREST {
-        let k = EASE_IN_OUT.at(p / LETTER_WAVE_CREST);
-        (cfg.wave_crest * k, lerp(1.0, peak, k))
+        // `pre-wipe-universal`: the feather creeping in ahead of the timestamp.
+        ((lit.t - w.pre_start) / w.pre_dur).clamp(0.0, 1.0) * feather
     } else {
-        let k = EASE_OUT.at((p - LETTER_WAVE_CREST) / (1.0 - LETTER_WAVE_CREST));
-        (lerp(cfg.wave_crest, cfg.wave_settle, k), lerp(peak, 1.0, k))
+        // `getLongWordWipeScale`: a long word's edge runs slower, so it takes the word's
+        // extra length to cross rather than racing through it in the held first syllable.
+        let chars = w.text.chars().filter(|c| !c.is_whitespace()).count() as f64;
+        let scale = 1.0 + ((chars - 6.0) / 10.0).clamp(0.0, 1.0) * LONG_WIPE_RATIO;
+        feather + (e / (w.dur * scale).max(0.001)).clamp(0.0, 1.0) * wide
+    };
+    // `char-glow`: every glyph of a held word breathes once, over its own span.
+    let plan = c.plan();
+    let mut breath = 0.0f32;
+    if text_glow > 0.0 && plan.glow > 0.0 {
+        let n = c.chars.max(1);
+        for i in 0..n {
+            breath += glow_env(lit.t - c.start - (i as f64 + 1.0) * plan.delay, plan.span);
+        }
+        breath /= n as f32;
     }
-}
-
-/// The group's sideways pop: (translateX in em, scaleX).
-fn wobble(e: f64) -> (f32, f32) {
-    if !(0.0..WOBBLE_DURATION).contains(&e) {
-        return (0.0, 1.0);
-    }
-    let p = EASE.at((e / WOBBLE_DURATION) as f32);
-    let peak = (0.05, 1.025);
-    if p < 0.125 {
-        let k = p / 0.125;
-        (peak.0 * k, lerp(1.0, peak.1, k))
-    } else if p < 0.75 {
-        let k = EASE_IN_OUT.at((p - 0.125) / 0.625);
-        (lerp(peak.0, 0.0, k), lerp(peak.1, 1.0, k))
-    } else {
-        (0.0, 1.0)
+    WordLook {
+        opacity: 1.0,
+        start: ((s - feather) / wide) as f32,
+        end: (s / wide) as f32,
+        glow: GLOW_EM * w.font.size,
+        glow_alpha: text_glow * (plan.glow as f32) * breath,
     }
 }
 
@@ -1645,20 +1893,19 @@ fn wobble(e: f64) -> (f32, f32) {
 struct GlyphQuad {
     rect: Rect,
     uv: Rect,
-    /// Letter index and count, for the letter-space gradient.
-    letter: usize,
-    letters: usize,
 }
 
-/// A word's glyphs this frame, in content coordinates (before the line transform):
-/// letter floats applied, then the group's wobble. Laid out once, at the font's size,
-/// and scaled with the line: a second size would put a second copy of every glyph in
-/// the shared font atlas, which only ever grows.
-fn word_glyphs(ctx: &egui::Context, w: &Word, lit: &LitState, cfg: &Cfg, wob: Option<(f32, f32, f32)>, atlas: [usize; 2]) -> Vec<GlyphQuad> {
+/// A word's glyphs this frame, in content coordinates (before the line transform): each
+/// glyph's `.char-motion` transform applied, so a `char-rise` word fans and swells as it
+/// rises and every other word rises whole on its unsplit clock. Laid out once, at the
+/// font's size, and scaled with the line: a second size would put a second copy of every
+/// glyph in the shared font atlas, which only ever grows.
+fn word_glyphs(ctx: &egui::Context, w: &Word, lit: &LitState, cfg: &Cfg, c: &Clock, atlas: [usize; 2]) -> Vec<GlyphQuad> {
     let g = ctx.fonts_mut(|fv| fv.layout_no_wrap(w.text.clone(), w.font.clone(), Color32::WHITE));
     let n: usize = g.rows.iter().map(|r| r.row.glyphs.len()).sum();
-    let waves = if w.letters && lit.live && lit.exit.is_none() { Some(letter_waves(n, w.dur.max(0.0), cfg.wave_duration)) } else { None };
-    let e = lit.t - w.start;
+    let running = lit.live && lit.exit.is_none();
+    let plan = c.plan();
+    let e = lit.t - c.start;
     let em = w.font.size;
     let mut out = Vec::with_capacity(n);
     let mut k = 0;
@@ -1671,21 +1918,17 @@ fn word_glyphs(ctx: &egui::Context, w: &Word, lit: &LitState, cfg: &Cfg, wob: Op
                 continue;
             }
             let mut r = Rect::from_min_size(w.pos + row.pos.to_vec2() + gl.pos.to_vec2() + uv.offset, uv.size);
-            if let Some(waves) = &waves {
-                let (lift, s) = letter_float(e, waves[idx], w.long, cfg);
-                // Letters scale about their own centre (`.blyrics--letter` box).
-                let c = pos2(w.pos.x + row.pos.x + gl.pos.x + gl.advance_width * 0.5, r.center().y);
-                r = Rect::from_min_max(c + (r.min - c) * s, c + (r.max - c) * s).translate(vec2(0.0, -lift * em));
-            }
-            if let Some((cx, tx, sx)) = wob {
-                let f = |x: f32| cx + (x - cx) * sx + tx;
-                r = Rect::from_x_y_ranges(f(r.left())..=f(r.right()), r.y_range());
+            if running {
+                let (lift, dx, s) = glyph_pose(w.cjk, &plan, c.first + idx, c.chars, e, cfg.rise);
+                // `.char-motion`: scale about the glyph's own bottom centre, then rise.
+                let o = pos2(r.center().x, r.bottom());
+                r = Rect::from_min_max(o + (r.min - o) * s, o + (r.max - o) * s).translate(vec2(dx * em, -lift * em));
             }
             let uvr = Rect::from_min_max(
                 pos2(uv.min[0] as f32 / atlas[0] as f32, uv.min[1] as f32 / atlas[1] as f32),
                 pos2(uv.max[0] as f32 / atlas[0] as f32, uv.max[1] as f32 / atlas[1] as f32),
             );
-            out.push(GlyphQuad { rect: r, uv: uvr, letter: idx, letters: n });
+            out.push(GlyphQuad { rect: r, uv: uvr });
         }
     }
     out
@@ -1717,29 +1960,21 @@ fn push_quad(mesh: &mut Mesh, r: Rect, uv: Rect, color: Color32, alpha: &dyn Fn(
     }
 }
 
-/// The lit gradient over one glyph, in screen x: (alpha function, cut points).
-/// Letter mode follows the per-letter masks (index space); otherwise the word box.
-/// `rtl`: the word reads right to left, so it's lit from the right.
-fn lit_gradient(q: &Rect, letter: usize, letters: usize, word: Rect, look: &WordLook, by_letter: bool, rtl: bool) -> (Box<dyn Fn(f32) -> f32>, Vec<f32>) {
+/// The lit gradient over the word box, in screen x: (alpha function, cut points).
+/// The edge runs from `start` to `end` of the word's width, so the wipe's feather is
+/// exact and never a box. `rtl`: the word reads right to left, so it's lit from the right.
+fn lit_gradient(word: Rect, look: &WordLook, rtl: bool) -> (Box<dyn Fn(f32) -> f32>, Vec<f32>) {
     let (s, e) = (look.start, look.end);
-    if rtl && !by_letter {
+    let w = word.width().max(1e-6);
+    if rtl {
+        // Lit at the right edge, gone one feather to its left.
         let xs = word.right() - word.width() * s;
         let xe = word.right() - word.width() * e - 1.0;
         let f = move |x: f32| if x >= xs { 1.0 } else if x <= xe { 0.0 } else { 1.0 - (xs - x) / (xs - xe) };
-        return (Box::new(f), vec![xe, xs]);
-    }
-    if by_letter {
-        let n = letters.max(1) as f32;
-        // In letter units across this glyph: X = letter + (x - left) / width.
-        let (l, w) = (q.left(), q.width().max(1e-6));
-        let i = letter as f32;
-        let x_at = |v: f32| l + (v * n - i) * w; // where X/n == v
-        let (xs, xe) = (x_at(s), x_at(e) + 1.0);
-        let f = move |x: f32| if x <= xs { 1.0 } else if x >= xe { 0.0 } else { 1.0 - (x - xs) / (xe - xs) };
-        (Box::new(f), vec![xs, xe])
+        (Box::new(f), vec![xe, xs])
     } else {
-        let xs = word.left() + word.width() * s;
-        let xe = word.left() + word.width() * e + 1.0;
+        let xs = word.left() + w * s;
+        let xe = word.left() + w * e + 1.0;
         let f = move |x: f32| if x <= xs { 1.0 } else if x >= xe { 0.0 } else { 1.0 - (x - xs) / (xe - xs) };
         (Box::new(f), vec![xs, xe])
     }
@@ -1763,58 +1998,44 @@ fn paint_words(
     let no_cut: [f32; 0] = [];
     let mut base = Mesh::with_texture(TextureId::default());
     let mut per_word = Vec::with_capacity(words.len());
-    for w in words {
-        let gr = &groups[w.group];
-        // Wobble: the group pops with its first word's timing (transform-origin: centre).
-        let wob = if cfg.wobble && gr.wobbles && lit.live && lit.exit.is_none() {
-            let first = &words[gr.first];
-            let (tx, sx) = wobble(lit.t - first.start);
-            let ws = &words[gr.words.clone()];
-            let l = ws.iter().map(|w| w.pos.x).fold(f32::INFINITY, f32::min);
-            let r = ws.iter().map(|w| w.pos.x + w.w).fold(f32::NEG_INFINITY, f32::max);
-            ((sx - 1.0).abs() > 1e-4 || tx.abs() > 1e-4).then_some(((l + r) * 0.5, tx * first.font.size, sx))
-        } else {
-            None
-        };
-        let quads = word_glyphs(ctx, w, lit, cfg, wob, atlas);
+    for (wi, w) in words.iter().enumerate() {
+        // The clock this piece of the line moves to: shared with the rest of its word
+        // when the script splits into glyphs, its own when it doesn't.
+        let c = clock(words, groups, wi);
+        let quads = word_glyphs(ctx, w, lit, cfg, &c, atlas);
         let dim_c = if w.bg { dim * 0.78 } else { dim } * opacity;
         for q in &quads {
-            push_quad(&mut base, xf.rect(q.rect), q.uv, theme::with_alpha(Color32::WHITE, dim_c), &|_| 1.0, &no_cut);
+            push_quad(&mut base, xf.rect(q.rect), q.uv, theme::with_alpha(cfg.colors.foreground, dim_c), &|_| 1.0, &no_cut);
         }
-        per_word.push((quads, wob));
+        per_word.push((quads, c));
     }
     // The dim run, then the highlight run over it (`.blyrics-highlight-run`, z-index 1):
     // each word's drop-shadow, then its lit text.
     painter.add(Shape::mesh(base));
-    for (wi, (w, (quads, wob))) in words.iter().zip(per_word).enumerate() {
-        let look = word_look(w, lit, cfg);
+    for (wi, (w, (quads, c))) in words.iter().zip(per_word).enumerate() {
+        let look = word_look(w, lit, cfg, &c);
         if look.opacity <= 0.0 || look.end <= 0.0 {
             continue;
         }
-        let word_box = {
-            let (cx, tx, sx) = wob.unwrap_or((0.0, 0.0, 1.0));
-            let f = |x: f32| cx + (x - cx) * sx + tx;
-            xf.rect(Rect::from_min_size(pos2(f(w.pos.x), w.pos.y), vec2(w.w * sx, w.h)))
-        };
+        let word_box = xf.rect(Rect::from_min_size(w.pos, vec2(w.w, w.h)));
         let mut m = Mesh::with_texture(TextureId::default());
-        let color = theme::with_alpha(cfg.active, look.opacity * opacity);
+        let color = theme::with_alpha(cfg.colors.active, look.opacity * opacity);
         let mut screen_quads = Vec::with_capacity(quads.len());
         for q in &quads {
             let r = xf.rect(q.rect);
-            let (alpha, cuts) = lit_gradient(&r, q.letter, q.letters, word_box, &look, w.letters, w.rtl);
+            let (alpha, cuts) = lit_gradient(word_box, &look, w.rtl);
             push_quad(&mut m, r, q.uv, color, alpha.as_ref(), &cuts);
-            screen_quads.push((r, q.uv, q.letter, q.letters, 1.0));
+            screen_quads.push((r, q.uv, 1.0));
         }
         if look.glow > 0.05 && look.glow_alpha >= GLOW_INVISIBLE && !dev_off("glow") {
             glow.push(GlowJob {
                 key: (key.0, key.1, key.2, wi as u32),
                 quads: screen_quads,
                 word: word_box,
-                by_letter: w.letters,
                 rtl: w.rtl,
                 radius: look.glow * xf.scale,
                 pills: Vec::new(),
-                color: theme::with_alpha(cfg.glow, look.glow_alpha * look.opacity * opacity),
+                color: theme::with_alpha(cfg.colors.glow, look.glow_alpha * look.opacity * opacity),
                 look,
                 layer: painter.add(Shape::Noop),
             });
@@ -1830,10 +2051,10 @@ fn paint_words(
 /// A word's drop-shadow to rasterize once this frame's glyphs are known.
 pub struct GlowJob {
     key: (u64, usize, u32, u32),
-    quads: Vec<(Rect, Rect, usize, usize, f32)>,
+    /// This frame's glyph quads: content box, atlas uv, and the alpha the gradient gives.
+    quads: Vec<(Rect, Rect, f32)>,
     word: Rect,
     look: WordLook,
-    by_letter: bool,
     rtl: bool,
     /// Blur radius in points (CSS: std deviation = radius / 2).
     radius: f32,
@@ -2009,7 +2230,7 @@ impl Glow {
             )
         };
         let mut quads = Vec::new();
-        let push_galley = |g: &Galley, origin: Pos2, weight: f32, quads: &mut Vec<(Rect, Rect, usize, usize, f32)>| {
+        let push_galley = |g: &Galley, origin: Pos2, weight: f32, quads: &mut Vec<(Rect, Rect, f32)>| {
             for row in &g.rows {
                 for gl in &row.row.glyphs {
                     let uv = gl.uv_rect;
@@ -2017,7 +2238,7 @@ impl Glow {
                         continue;
                     }
                     let r = Rect::from_min_size(origin + row.pos.to_vec2() + gl.pos.to_vec2() + uv.offset, uv.size);
-                    quads.push((r, uv_of(uv.min, uv.max), 0, 1, weight));
+                    quads.push((r, uv_of(uv.min, uv.max), weight));
                 }
             }
         };
@@ -2039,7 +2260,6 @@ impl Glow {
             quads,
             word: bounds,
             look: WordLook { opacity: 1.0, start: 2.0, end: 3.0, glow: 0.0, glow_alpha: 0.0 },
-            by_letter: false,
             rtl: false,
             // CSS `blur(r)` is a Gaussian with σ = r.
             radius: radius * 2.0,
@@ -2101,8 +2321,8 @@ fn rasterize_glow(atlas: &Coverage, j: &GlowJob, ppp: f32, scratch: &mut Vec<f32
         paint_pill(scratch, w, h, (r.min - origin) * ppp, r.size() * ppp, radius * ppp, ppp, alpha);
     }
     let (aw, ah) = (atlas.size[0] as f32, atlas.size[1] as f32);
-    for &(r, uv, letter, letters, weight) in &j.quads {
-        let (alpha, _) = lit_gradient(&r, letter, letters, j.word, &j.look, j.by_letter, j.rtl);
+    for &(r, uv, weight) in &j.quads {
+        let (alpha, _) = lit_gradient(j.word, &j.look, j.rtl);
         let tx0 = (uv.left() * aw).round() as isize;
         let ty0 = (uv.top() * ah).round() as isize;
         let tw = ((uv.right() - uv.left()) * aw).round() as isize;
@@ -2339,9 +2559,9 @@ fn paint_instrumental(painter: &egui::Painter, cfg: &Cfg, b: &Block, xf: &Xf, t:
         // only one of them can be happening at a time.
         let k = ((t - b.start - i as f64 * step) / step).clamp(0.0, 1.0) as f32;
         let lit = k * k * (3.0 - 2.0 * k);
-        painter.circle_filled(c, r, theme::with_alpha(Color32::WHITE, GAP_DOT_REST * alpha));
+        painter.circle_filled(c, r, theme::with_alpha(cfg.colors.foreground, GAP_DOT_REST * alpha));
         if lit > 0.0 {
-            painter.circle_filled(c, r, theme::with_alpha(cfg.active, lit * alpha));
+            painter.circle_filled(c, r, theme::with_alpha(cfg.colors.active, lit * alpha));
         }
     }
     (into >= 0.0 && into <= GAP_ENTER) || t < b.start + step * GAP_DOTS as f64 || (t >= exit_start && t < until)
@@ -2356,6 +2576,157 @@ pub fn dev_off(what: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn light_sidebar_uses_contrasting_lyric_colors() {
+        let text = Color32::from_rgb(22, 20, 26);
+        let background = Color32::from_rgb(246, 244, 248);
+        let custom = Color32::from_rgb(90, 20, 32);
+        let custom_glow = Color32::from_rgb(255, 106, 0);
+        let colors = |surface, light, active, glow| LyricColors::new(surface, light, text, background, active, glow);
+
+        let sidebar = colors(Surface::Sidebar, true, Color32::WHITE, Color32::WHITE);
+        assert_eq!((sidebar.foreground, sidebar.active, sidebar.glow), (text, text, Color32::WHITE));
+        assert_eq!(sidebar.dim_alpha(0.0), 0.0);
+        assert_eq!(sidebar.dim_alpha(1.0), 1.0);
+        assert!((sidebar.dim_alpha(0.3) - 0.51).abs() < 1e-6);
+        let dim = theme::lerp_color(background, text, sidebar.dim_alpha(0.3));
+        assert!(contrast_ratio(dim, background) >= 3.0);
+
+        let preserved = colors(Surface::Sidebar, true, custom, custom_glow);
+        assert_eq!((preserved.active, preserved.glow), (custom, custom_glow));
+        for bright in [Color32::from_rgb(250, 88, 106), Color32::from_gray(222)] {
+            let adjusted = colors(Surface::Sidebar, true, bright, custom_glow);
+            assert_ne!(adjusted.active, bright);
+            assert!(contrast_ratio(adjusted.active, background) >= 6.0);
+            assert_eq!(adjusted.glow, custom_glow);
+        }
+        for (surface, light) in [(Surface::Player, false), (Surface::Player, true), (Surface::Sidebar, false)] {
+            let unchanged = colors(surface, light, Color32::WHITE, custom_glow);
+            assert_eq!((unchanged.foreground, unchanged.active, unchanged.glow), (Color32::WHITE, Color32::WHITE, custom_glow));
+            assert_eq!(unchanged.dim_alpha(0.3), 0.3);
+        }
+    }
+
+    fn draw_test_view(ctx: &egui::Context, view: &mut View, lyrics: &Lyrics, style: &LyricStyle, surface: Surface, t: f64, now: f64, height: f32) {
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(350.0, height));
+        // The glow textures the draw allocates get no painter here, so the pass's delta
+        // is dropped on purpose.
+        ctx.run_ui(Default::default(), |ui| {
+            let key = if surface == Surface::Player { 1 } else { 2 };
+            view.show(ui, Frame { lyrics, key, roman: vec![], trans: vec![], t, playing: false, now, rect, style, accent: Color32::WHITE, centered: false, surface, scale: 1.0 });
+        })
+        .textures_delta
+        .clear();
+    }
+
+    #[test]
+    fn sidebar_anchor_and_scroll_state_are_independent() {
+        let ctx = shot_ctx();
+        let mut style = LyricStyle::default();
+        style.blur = 0.0;
+        for sync in [Sync::Line, Sync::Word] {
+            let lyrics = Lyrics {
+                lines: (0..12).map(|i| {
+                    let start = 1000 + i * 5000;
+                    Line {
+                        start,
+                        dur: 4000,
+                        text: "hello world".into(),
+                        parts: if sync == Sync::Word { vec![Part { start, dur: 4000, text: "hello world".into(), bg: false }] } else { vec![] },
+                        ..Default::default()
+                    }
+                }).collect(),
+                sync,
+                provider: crate::lyrics::Provider::LrclibSynced,
+                language: None,
+                songwriters: vec![],
+            };
+            let (mut player, mut sidebar) = (View::default(), View::default());
+            draw_test_view(&ctx, &mut player, &lyrics, &style, Surface::Player, 0.0, 100.0, 700.0);
+            draw_test_view(&ctx, &mut sidebar, &lyrics, &style, Surface::Sidebar, 0.0, 100.0, 700.0);
+            let center = |v: &View, i: usize| {
+                let l = v.layout.as_ref().unwrap();
+                l.pad_top + l.blocks[i].top + l.blocks[i].height / 2.0 - v.scroll_top
+            };
+            let check_sidebar = |v: &View, i: usize, height: f32| {
+                let l = v.layout.as_ref().unwrap();
+                let top = l.pad_top + l.blocks[i].top - v.scroll_top;
+                let size = l.blocks[i].words[0].font.size;
+                let fade = (size * 1.6).min(height * 0.15).max(1.0);
+                assert!(top >= fade - 0.1 && top <= (height * 0.12).max(fade) + 0.1);
+            };
+            assert!((center(&player, 0) - 700.0 * style.anchor).abs() < 0.1);
+            check_sidebar(&sidebar, 0, 700.0);
+            assert_ne!(sidebar.shown_pass, 0, "first relayout must retain the draw pass");
+            let mut short = View::default();
+            draw_test_view(&ctx, &mut short, &lyrics, &style, Surface::Sidebar, 0.0, 100.0, 350.0);
+            let size = short.layout.as_ref().unwrap().blocks[0].words[0].font.size;
+            let fade = (size * 1.6).min(350.0 * 0.15).max(1.0);
+            assert!(center(&short, 0) >= fade + size * 0.5 - 0.1);
+
+            draw_test_view(&ctx, &mut player, &lyrics, &style, Surface::Player, 16.0, 100.1, 700.0);
+            draw_test_view(&ctx, &mut sidebar, &lyrics, &style, Surface::Sidebar, 16.0, 100.1, 700.0);
+            assert!(!player.scrolls.is_empty() && !sidebar.scrolls.is_empty());
+            check_sidebar(&sidebar, 3, 700.0);
+            let player_scroll = player.scroll_top;
+            sidebar.user_until = 200.0;
+            sidebar.was_user = true;
+            sidebar.scroll_top = 0.0;
+            draw_test_view(&ctx, &mut sidebar, &lyrics, &style, Surface::Sidebar, 16.0, 100.2, 700.0);
+            assert_eq!(sidebar.scroll_top, 0.0);
+            assert_eq!(player.scroll_top, player_scroll);
+            sidebar.resume();
+            draw_test_view(&ctx, &mut sidebar, &lyrics, &style, Surface::Sidebar, 16.0, 100.3, 700.0);
+            check_sidebar(&sidebar, 3, 700.0);
+
+            let old_key = sidebar.layout.as_ref().unwrap().key;
+            draw_test_view(&ctx, &mut sidebar, &lyrics, &style, Surface::Sidebar, 16.0, 100.4, 900.0);
+            assert_ne!(sidebar.layout.as_ref().unwrap().key, old_key);
+            check_sidebar(&sidebar, 3, 900.0);
+            // A backward seek follows the same scroll animation, without moving the player view.
+            draw_test_view(&ctx, &mut sidebar, &lyrics, &style, Surface::Sidebar, 6.0, 100.5, 900.0);
+            check_sidebar(&sidebar, 1, 900.0);
+            assert_eq!(player.scroll_top, player_scroll);
+            sidebar.reset();
+            assert!(sidebar.layout.is_none() && player.layout.is_some());
+            draw_test_view(&ctx, &mut sidebar, &lyrics, &style, Surface::Sidebar, 0.0, 101.0, 700.0);
+            check_sidebar(&sidebar, 0, 700.0);
+        }
+    }
+
+    #[test]
+    fn anchor_changes_invalidate_layout_and_hidden_textures_are_released() {
+        let ctx = shot_ctx();
+        let lyrics = Lyrics {
+            lines: vec![Line { start: 1000, dur: 4000, text: "hello".into(), ..Default::default() }],
+            sync: Sync::Line,
+            provider: crate::lyrics::Provider::LrclibSynced,
+            language: None,
+            songwriters: vec![],
+        };
+        let mut style = LyricStyle::default();
+        style.blur = 0.0;
+        let mut view = View::default();
+        draw_test_view(&ctx, &mut view, &lyrics, &style, Surface::Player, 0.0, 100.0, 700.0);
+        let old_key = view.layout.as_ref().unwrap().key;
+        let old_pad = view.layout.as_ref().unwrap().pad_top;
+        style.anchor = 0.2;
+        draw_test_view(&ctx, &mut view, &lyrics, &style, Surface::Player, 0.0, 100.1, 700.0);
+        assert_ne!(view.layout.as_ref().unwrap().key, old_key);
+        assert!(view.layout.as_ref().unwrap().pad_top < old_pad);
+
+        let slot = view.glow.upload(&ctx, None, ColorImage::filled([10, 10], Color32::WHITE), "test-hidden");
+        view.glow.spare.push(slot);
+        view.shown_pass = 10;
+        view.reset();
+        assert_eq!(view.shown_pass, 10);
+        view.release_hidden(11);
+        assert_eq!(view.glow.spare.len(), 1);
+        view.release_hidden(12);
+        assert!(view.glow.spare.is_empty());
+        assert_eq!(view.shown_pass, 0);
+    }
 
     #[test]
     fn slots_are_rewritten_in_place() {
@@ -2448,7 +2819,9 @@ mod tests {
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx, "Inter");
         for _ in 0..2 {
-            let _ = ctx.run_ui(Default::default(), |_| {});
+            // The first pass uploads the font atlas. Nothing draws here, so there's no
+            // painter to hand the delta to; epaint only complains about the drop in debug.
+            ctx.run_ui(Default::default(), |_| {}).textures_delta.clear();
         }
         ctx
     }
@@ -2601,48 +2974,133 @@ mod tests {
     }
 
     #[test]
-    fn letter_waves_crest_when_lit() {
-        // A 1 s word with 4 letters: the last letter starts later than the first.
-        let w = letter_waves(4, 1.0, 0.9);
-        assert!(w[0].0 < w[3].0);
-        // Zero-duration words float all letters together.
-        assert!(letter_waves(3, 0.0, 0.9).iter().all(|w| w.0 == 0.0 && (w.1 - 0.9).abs() < 1e-9));
+    fn springs_settle_without_oscillating() {
+        // `springProgress`: monotone, from rest to 1 by its own duration.
+        let mut prev = -1.0;
+        for k in 0..=20 {
+            let v = spring_progress(k as f64 / 10.0, 2.0);
+            assert!(v >= prev, "spring_progress must not go backwards");
+            assert!((0.0..=1.0000001).contains(&v), "stays between 0 and 1, got {v}");
+            prev = v;
+        }
+        assert!((spring_progress(2.0, 2.0) - 1.0).abs() < 0.02);
+        // `sampleSpring`: the underdamped spring a word's rise and the view's scroll use,
+        // from rest to nearly 1 within its settling time.
+        assert_eq!(spring_step(0.0, 14.0f64.sqrt(), 3.5 / 14.0f64.sqrt()), 0.0);
+        assert!(spring_step(2.0, 14.0f64.sqrt(), 3.5 / 14.0f64.sqrt()) > 0.99);
     }
 
     #[test]
-    fn scroll_durations_follow_the_extension() {
-        assert!((scroll_duration(0, 10.0) - (0.750 + 2f64.ln() * 0.08 + 0.02)).abs() < 1e-9);
-        assert!((scroll_duration(-3, 10.0) - 0.810).abs() < 1e-9);
-        assert!((scroll_duration(2, 10.0) - (0.750 + 4f64.ln() * 0.08 + 0.06)).abs() < 1e-9);
+    fn glyph_glow_breathes_to_the_keyframes() {
+        let span = 4.0;
+        assert_eq!(glow_env(0.0, span), 0.0);
+        assert!((glow_env(0.15 * span, span) - 0.8).abs() < 1e-6);
+        assert!((glow_env(0.30 * span, span) - 1.0).abs() < 1e-6);
+        assert!((glow_env(0.45 * span, span) - 0.65).abs() < 1e-6);
+        assert!((glow_env(0.60 * span, span) - 0.3).abs() < 1e-6);
+        assert!((glow_env(span, span) - 0.0).abs() < 1e-6);
+        // Before it starts, or with no span to run over: nothing.
+        assert_eq!(glow_env(-1.0, span), 0.0);
+        assert_eq!(glow_env(1.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn only_a_held_non_cjk_word_glows() {
+        // Past a beat: the fan opens over a second, the shadow over half one, and the
+        // shadow stops at `--char-glow-max` 0.45 rather than reaching full strength.
+        let held = Clock { start: 0.0, dur: 3.0, chars: 6, first: 0, cjk: false }.plan();
+        assert!((held.emphasis - 1.0).abs() < 1e-9);
+        assert!((held.glow - 0.45).abs() < 1e-9);
+        let rising = Clock { start: 0.0, dur: 1.25, chars: 6, first: 0, cjk: false }.plan();
+        assert!((rising.emphasis - 0.25).abs() < 1e-9);
+        assert!((rising.glow - 0.225).abs() < 1e-9);
+        let short = Clock { start: 0.0, dur: 0.5, chars: 6, first: 0, cjk: false }.plan();
+        assert_eq!(short.emphasis, 0.0);
+        assert_eq!(short.glow, 0.0);
+        let cjk = Clock { start: 0.0, dur: 3.0, chars: 6, first: 0, cjk: true }.plan();
+        assert_eq!(cjk.emphasis, 0.0);
+        assert_eq!(cjk.glow, 0.0);
+        // CJK staggers its glyphs tighter (never more than 50 ms apart, nor a fifth of a
+        // second split between them) and never finishes before 3 s.
+        assert!((cjk.delay - 0.2 / 6.0).abs() < 1e-9);
+        assert!(cjk.span >= 3.0);
+        assert!((held.delay - (3.0 / 6.0) * 0.35).abs() < 1e-9);
+        assert_eq!(held.hold, 2.0 * 3.0 / 6.0);
+    }
+
+    #[test]
+    fn glyphs_rise_one_after_another_and_spread_while_held() {
+        let p = Clock { start: 0.0, dur: 1.5, chars: 4, first: 0, cjk: false }.plan();
+        // Nothing has moved before the first glyph is due.
+        assert_eq!(char_pose(&p, 0, 4, 0.0, 3.0), (0.0, 0.0, 1.0));
+        assert_eq!(char_pose(&p, 3, 4, 0.3, 3.0).0, 0.0, "the last glyph is not due yet");
+        // `getCharacterFrames`: the rise runs for the word's response.
+        let risen = |i: usize, t: f64| char_pose(&p, i, 4, t, 3.0).0 - char_pose(&p, i, 4, t, 0.0).0;
+        let early = risen(0, 0.8);
+        assert!(early > 1.5 && early < 3.0, "still on its way at {early}");
+        assert!((risen(0, 3.0) - 3.0 * 0.92).abs() < 0.01);
+        let (a_lift, b_lift) = (risen(0, 1.2), risen(3, 1.2));
+        assert!(a_lift > b_lift + 0.1, "the glyph sung later is behind: {a_lift} {b_lift}");
+        assert!((risen(0, 4.0) - risen(3, 4.0)).abs() < 1e-3, "both have finished rising");
+        let a_dx = char_pose(&p, 0, 4, 1.2, 3.0).1;
+        let b_dx = char_pose(&p, 3, 4, 1.2, 3.0).1;
+        // The fan is symmetric about the middle and swells as it spreads.
+        assert!(a_dx < 0.0 && b_dx > 0.0, "spread from the centre: {a_dx} {b_dx}");
+        assert!(char_pose(&p, 1, 4, 1.2, 3.0).2 > 1.0);
+        // Once the breath is over the spread and swell are gone, and the rise holds.
+        let (lift, dx, s) = char_pose(&p, 0, 4, 12.0, 3.0);
+        assert!(dx.abs() < 1e-6 && (s - 1.0).abs() < 1e-6, "settles back: {dx} {s}");
+        assert!((lift - 3.0 * 0.92).abs() < 0.01, "holds its rise at {lift}");
+    }
+
+    #[test]
+    fn every_word_moves_letter_by_letter() {
+        let plan = Clock { start: 0.0, dur: 3.0, chars: 4, first: 0, cjk: false }.plan();
+        // Each glyph has a clock of its own, as am-lyrics' `.character` spans do.
+        assert!(
+            (0..300).any(|k| {
+                let t = k as f64 * 0.01;
+                glyph_pose(false, &plan, 0, 4, t, 3.0) != glyph_pose(false, &plan, 3, 4, t, 3.0)
+            }),
+            "a word moves letter by letter"
+        );
+        // Held, it swells and fans from its middle.
+        assert!(glyph_pose(false, &plan, 1, 4, 1.6, 3.0).2 > 1.0, "swells while held");
+        // Once the breath is over the glyphs settle back into an upright row.
+        let (_, dx, s) = glyph_pose(false, &plan, 0, 4, 20.0, 3.0);
+        assert!(dx.abs() < 1e-6 && (s - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_standalone_script_keeps_its_own_clock() {
+        assert!(cjk_script("青花瓷"));
+        assert!(cjk_script("さくら"));
+        assert!(cjk_script("안녕"));
+        assert!(!cjk_script("hello"));
+    }
+
+    #[test]
+    fn scroll_cascade_delays_but_never_slows() {
+        assert_eq!(scroll_cascade(0), 0.0);
+        assert!((scroll_cascade(-3) - 0.15).abs() < 1e-9);
+        // Upstream stops the cascade at four lines, so the far end of a long view lands
+        // with the rest rather than trailing behind it.
+        assert!((scroll_cascade(9) - 0.2).abs() < 1e-9);
     }
 
     #[test]
     fn gradient_is_soft_and_never_a_box() {
         let look = WordLook { opacity: 1.0, start: 0.5, end: 0.6, glow: 0.0, glow_alpha: 0.5 };
         let word = Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 40.0));
-        let (f, cuts) = lit_gradient(&word, 0, 1, word, &look, false, false);
+        let (f, cuts) = lit_gradient(word, &look, false);
         assert_eq!(f(10.0), 1.0);
         assert!(f(55.0) > 0.0 && f(55.0) < 1.0);
         assert_eq!(f(70.0), 0.0);
         assert_eq!(cuts.len(), 2);
-    }
-
-    #[test]
-    fn a_held_word_swells_its_glow_then_gives_it_back() {
-        let from = 8.0f32;
-        let top = from * GLOW_SWELL as f32;
-        assert_eq!(held_glow(0.0, 3.0, from), from);
-        // Growing from the first frame of the word, and never past the cap.
-        let (early, mid) = (held_glow(0.2, 3.0, from), held_glow(0.9, 3.0, from));
-        assert!(early > from && mid > early, "swells: {from} → {early} → {mid}");
-        assert!(mid <= top + 0.01, "stays under the cap {top}, got {mid}");
-        // Plateau: a note held long past the rise stays lit at the cap, not brighter.
-        assert!((held_glow(2.9, 3.0, from) - top).abs() < 0.05, "holds at {top}");
-        // Released after the word ends, and gone once the release is through.
-        assert!(held_glow(3.4, 3.0, from) < top);
-        assert_eq!(held_glow(3.0 + GLOW_RELEASE as f64 + 0.1, 3.0, from), 0.0);
-        // No glow colour to give: nothing to swell.
-        assert_eq!(held_glow(1.0, 3.0, 0.0), 0.0);
+        // A right-to-left word is lit from the right edge instead.
+        let (g, _) = lit_gradient(word, &look, true);
+        assert_eq!(g(99.0), 1.0);
+        assert_eq!(g(20.0), 0.0);
     }
 
     #[test]

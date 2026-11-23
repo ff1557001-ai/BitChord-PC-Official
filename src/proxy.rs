@@ -131,6 +131,10 @@ pub fn apply(b: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
 static CIRCUIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static HTTP: std::sync::RwLock<Option<reqwest::Client>> = std::sync::RwLock::new(None);
 
+/// The agent the shared client sends, and the one a stream request names when it builds
+/// its own header (`stream::download` always sets one).
+pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36";
+
 /// The client for YouTube Music and its streams. It's rebuilt when `new_circuit`
 /// picks another exit: pooled connections would otherwise stay on the old one.
 pub fn http() -> reqwest::Client {
@@ -153,7 +157,7 @@ fn build_for(n: u32) -> reqwest::Client {
         .pool_idle_timeout(Duration::from_secs(30))
         // A server that stops sending mid-response; streams have their own, tighter check.
         .read_timeout(Duration::from_secs(30))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36")
+        .user_agent(UA)
         .build()
         .unwrap_or_default()
 }

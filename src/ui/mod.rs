@@ -5,6 +5,7 @@
 
 mod account;
 mod actions;
+mod backdrop;
 mod collections;
 mod dev;
 mod dialogs;
@@ -15,6 +16,7 @@ mod karaoke;
 mod keys;
 mod lists;
 mod lyric_prefs;
+mod lyrics_share;
 mod mini;
 mod notes;
 mod nowplaying;
@@ -64,6 +66,10 @@ pub enum Page {
     Album(String),
     Playlist(String),
     Artist(String),
+    /// Apple's own collection page, by its address.
+    AppleCollection(String),
+    /// The whole of one home or New section, opened by clicking its name.
+    SeeAll,
     Settings,
     /// Transfer from Spotify.
     Transfer,
@@ -74,8 +80,91 @@ pub enum LibTab {
     Playlists,
     Songs,
     Albums,
+    Artists,
     History,
     Uploads,
+}
+
+impl LibTab {
+    /// The name the page wears — Apple's own, which for playlists is the whole of them.
+    pub fn title(self) -> &'static str {
+        match self {
+            LibTab::Playlists => "All Playlists",
+            LibTab::Songs => "Songs",
+            LibTab::Albums => "Albums",
+            LibTab::Artists => "Artists",
+            LibTab::History => "Recently Played",
+            LibTab::Uploads => "Uploads",
+        }
+    }
+}
+
+/// How a library tab orders what it holds — Apple's Sort popup, which every library page
+/// carries and which the pages remember between visits and launches.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LibSort {
+    /// The order YouTube Music returns: newest first.
+    Added,
+    Title,
+    Artist,
+}
+
+impl LibSort {
+    /// The orders this page offers. Apple's own set differs per tab, and every one of
+    /// them is a name YouTube's data can answer for.
+    pub fn options(tab: LibTab) -> &'static [LibSort] {
+        match tab {
+            // A playlist's subtitle says what it is, not who made it, so there's no
+            // artist to order by.
+            LibTab::Playlists | LibTab::Artists => &[LibSort::Added, LibSort::Title],
+            _ => &[LibSort::Added, LibSort::Title, LibSort::Artist],
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LibSort::Added => "Recently Added",
+            LibSort::Title => "Name",
+            LibSort::Artist => "Artist",
+        }
+    }
+
+    /// The saved choice, or the newest-first default.
+    pub fn read(stored: Option<&str>) -> Self {
+        match stored {
+            Some("title") => LibSort::Title,
+            Some("artist") => LibSort::Artist,
+            _ => LibSort::Added,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            LibSort::Added => "added",
+            LibSort::Title => "title",
+            LibSort::Artist => "artist",
+        }
+    }
+
+    /// The cards of a library tab, in this order. Added keeps what YouTube sent.
+    pub fn sort(self, cards: &mut [crate::model::Card]) {
+        match self {
+            LibSort::Added => {}
+            LibSort::Title => cards.sort_by(|a, b| sort_key(&a.title).cmp(&sort_key(&b.title))),
+            // A library album's subtitle is its artist line; ties break on the release.
+            LibSort::Artist => cards.sort_by(|a, b| sort_key(&a.subtitle).cmp(&sort_key(&b.subtitle)).then_with(|| sort_key(&a.title).cmp(&sort_key(&b.title)))),
+        }
+    }
+}
+
+/// A name as a sort key: lower-case and under its own first word, so "Bad" sorts
+/// under B and not under T for "The Bad".
+pub(crate) fn sort_key(s: &str) -> String {
+    let s = s.trim().to_lowercase();
+    match s.strip_prefix("the ") {
+        Some(rest) => rest.to_owned(),
+        None => s,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -89,17 +178,27 @@ pub enum NpTab {
 /// User intents collected while drawing; applied after the frame's UI pass.
 pub enum Action {
     Play(Vec<Track>, usize),
+    /// A list's Shuffle control: play these songs with the queue's shuffle mark on, so
+    /// what follows is random and switching the mark off puts them back in this order.
+    PlayShuffled(Vec<Track>),
     PlayCollection(Target, bool),
     /// Click on a card: songs start a radio, everything else opens its page.
     Open(Target),
+    /// Play an Apple collection's own songs, each found on the source that has it.
+    ApplePlay { target: Target, songs: Vec<crate::apple::AppleSong>, shuffle: bool },
     PlayNext(Track),
     Enqueue(Track),
     Radio(Track),
     Go(Page),
+    /// A section's name clicked: put all it holds on a page of its own.
+    SeeAll(Shelf),
     QueueJump(usize),
     QueueRemove(usize),
     /// A queue row one place up (`dir` negative) or down.
     QueueMove(usize, isize),
+    /// A queue row put just after the song playing — the queue's own "Play next", which
+    /// moves the row instead of queueing a second copy of the song.
+    QueuePlayNext(usize),
     /// Open up next (the player's) or the queue drawer (the bar's).
     ViewQueue,
     Seek(f32),
@@ -108,9 +207,11 @@ pub enum Action {
     LikeMany(Vec<Track>, bool),
     Dislike(Track),
     Share(Target),
+    ShareLyrics { video_id: String, generation: u64, provider: Option<crate::lyrics::Provider> },
+    AboutSong(Track),
+    AboutAlbum { id: String, title: String, artist: String },
     AddToPlaylist(Vec<Track>),
-    /// Rows (indices into the open playlist) to take out of it.
-    RemoveFromPlaylist(Vec<usize>),
+    RemoveFromPlaylist { playlist: String, items: Vec<(String, String)> },
     Download(Track),
     NewPlaylist(Vec<Track>),
     EditPlaylist,
@@ -119,11 +220,15 @@ pub enum Action {
     DeletePlaylist,
     SaveCollection(String, bool),
     HomeChip(Option<String>),
+    /// A mood tile clicked: play its station rather than filter the feed.
+    MoodStation(crate::ytm::Mood),
     OpenNowPlaying(bool),
     /// Into the mini player (true) or back to the full window.
     Mini(bool),
     /// Play/pause what's already loaded (a card's button on the playing item).
     TogglePlay,
+    /// Send lossless tracks straight to the DAC in WASAPI exclusive mode.
+    BitPerfect(bool),
     /// Drop the hi-res stream and replay the current song from YouTube at the same spot.
     RevertQuality,
     /// Clear a quality revert and replay, asking hi-res sources again.
@@ -132,7 +237,21 @@ pub enum Action {
     TransferPick(Track),
 }
 
+fn removal_items(c: &crate::backend::Collection, rows: impl IntoIterator<Item = usize>) -> Vec<(String, String)> {
+    rows.into_iter().filter_map(|i| Some((c.tracks.get(i)?.id.clone(), c.set_ids.get(i)?.as_ref()?.clone()))).collect()
+}
+
+fn removal_rows(c: &crate::backend::Collection, items: &[(String, String)]) -> Vec<usize> {
+    let entries: HashSet<_> = items.iter().map(|(id, set)| (id.as_str(), set.as_str())).collect();
+    c.tracks.iter().enumerate().filter_map(|(i, t)| {
+        let set = c.set_ids.get(i)?.as_deref()?;
+        entries.contains(&(t.id.as_str(), set)).then_some(i)
+    }).collect()
+}
+
 enum Dialog {
+    GeniusAbout { track: Track, description: Option<Option<String>> },
+    AppleAlbumAbout { id: String, title: String, artist: String, description: Option<Option<String>> },
     PickPlaylist(Vec<Track>),
     NewPlaylist { title: String, tracks: Vec<Track> },
     EditPlaylist { id: String, title: String, description: String, privacy: Option<String> },
@@ -169,6 +288,18 @@ impl Selection {
         *self = Self { page: Some(page.clone()), active: true, ..Self::default() };
     }
 
+    /// A replacement or edit can change the meaning of collection row indices.
+    fn collection_changed(&mut self, id: &str) {
+        let matches = match self.page.as_ref() {
+            Some(Page::Album(page_id) | Page::Playlist(page_id)) => page_id == id,
+            Some(Page::Library(LibTab::Songs)) => id == LIKED_MUSIC,
+            _ => false,
+        };
+        if matches {
+            self.clear();
+        }
+    }
+
     /// Toggle row `i`, or with `range` pick every row from the last one toggled to it.
     pub fn pick(&mut self, page: &Page, i: usize, range: bool) {
         if self.page.as_ref() != Some(page) {
@@ -184,14 +315,32 @@ impl Selection {
             }
         }
     }
+
+    /// A filtered range contains only visible rows, even when source indices have gaps.
+    fn pick_visible(&mut self, page: &Page, i: usize, range: bool, visible: &[usize]) {
+        if range && self.page.as_ref() == Some(page)
+            && let Some(a) = self.anchor.and_then(|a| visible.iter().position(|&row| row == a))
+            && let Some(b) = visible.iter().position(|&row| row == i)
+        {
+            self.rows.extend(visible[a.min(b)..=a.max(b)].iter().copied());
+        } else if range {
+            if self.page.as_ref() != Some(page) {
+                *self = Self { page: Some(page.clone()), ..Self::default() };
+            }
+            self.rows.insert(i);
+            self.anchor = Some(i);
+        } else {
+            self.pick(page, i, false);
+        }
+    }
 }
 
 pub struct HomeState {
     pub chips: Vec<Chip>,
     pub shelves: Vec<Shelf>,
     pub continuation: Option<String>,
-    /// When the next shelves were requested (app time, s), while they load.
-    pub loading_more: Option<f64>,
+    /// When and which continuation was requested while more shelves load.
+    pub loading_more: Option<(f64, String)>,
     pub picks_loading: bool,
     pub picks_expanded: bool,
 }
@@ -226,7 +375,10 @@ pub struct RecentSearch {
 pub struct MotionView {
     motion: std::sync::Arc<crate::motion::Motion>,
     tex: Option<egui::TextureHandle>,
+    /// The same frame taken down to a few pixels wide, for a backdrop out of focus.
+    blur: Option<egui::TextureHandle>,
     seen: u64,
+    blur_seen: u64,
     /// The width this decoder was started at: a larger view replaces it once.
     width: u32,
     /// When a view last asked for a frame; idle ones are dropped, decoder and all.
@@ -235,7 +387,7 @@ pub struct MotionView {
 
 impl MotionView {
     fn new(motion: std::sync::Arc<crate::motion::Motion>, width: u32) -> Self {
-        Self { motion, tex: None, seen: 0, width, last_used: std::time::Instant::now() }
+        Self { motion, tex: None, blur: None, seen: 0, blur_seen: 0, width, last_used: std::time::Instant::now() }
     }
 
     /// The newest frame as a texture, once one has been decoded.
@@ -252,12 +404,328 @@ impl MotionView {
         }
         self.tex.as_ref()
     }
+
+    /// The newest frame taken down to forty pixels across: stretched back up it reads as
+    /// the video out of focus, which is what a column of lyrics over a video wants.
+    /// A grid of samples, not a filter — the whole frame averaged would cost more per
+    /// frame than the picture is worth.
+    fn blurred(&mut self, ctx: &egui::Context) -> Option<&egui::TextureHandle> {
+        if let Some((version, frame)) = self.motion.latest()
+            && version != self.blur_seen
+        {
+            self.blur_seen = version;
+            let (w, h) = (frame.w.max(1), frame.h.max(1));
+            let cols = 40usize;
+            let rows = (cols * h / w).max(1);
+            let mut pixels = Vec::with_capacity(cols * rows);
+            for ry in 0..rows {
+                for rx in 0..cols {
+                    let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+                    for dy in 0..4 {
+                        for dx in 0..4 {
+                            let x = ((rx * 4 + dx) * w / (cols * 4)).min(w - 1);
+                            let y = ((ry * 4 + dy) * h / (rows * 4)).min(h - 1);
+                            let i = (y * w + x) * 4;
+                            r += frame.rgba[i] as u32;
+                            g += frame.rgba[i + 1] as u32;
+                            b += frame.rgba[i + 2] as u32;
+                        }
+                    }
+                    pixels.push(Color32::from_rgb((r / 16) as u8, (g / 16) as u8, (b / 16) as u8));
+                }
+            }
+            let image = egui::ColorImage::new([cols, rows], pixels);
+            match &mut self.blur {
+                Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
+                None => self.blur = Some(ctx.load_texture("motion-blur", image, egui::TextureOptions::LINEAR)),
+            }
+        }
+        self.blur.as_ref()
+    }
 }
 
 impl Drop for MotionView {
     fn drop(&mut self) {
         // Off screen: the decoder stops at its next frame instead of looping on.
         self.motion.stop();
+    }
+}
+
+/// Apple's moving artwork, kept in one place: which releases have a sleeve and where it
+/// is, what's asked and what's cooling, and the decoders on screen. A page borrows just
+/// this to ask its tiles for sleeves, which leaves the rest of the app — the feed it's
+/// drawing from — borrowed at the same time.
+#[derive(Default)]
+pub struct AppleArt {
+    /// Motion sleeve master playlist per release key (`None`: Apple has none).
+    covers: std::collections::HashMap<String, Option<String>>,
+    /// Releases Apple had nothing for when last asked, and when: asked again after a
+    /// while, since a lookup can fail on a network hiccup rather than for good.
+    missed: std::collections::HashMap<String, std::time::Instant>,
+    /// Apple lookups already in flight.
+    waiting: std::collections::HashSet<String>,
+    /// Decoders for the motion sleeves on screen.
+    views: std::collections::HashMap<String, MotionView>,
+}
+
+impl AppleArt {
+    /// Ask Apple, once, for the motion sleeve of a release. `title` names the song whose
+    /// sleeve is wanted and `None` asks for the release `album` itself; `apple` is
+    /// Apple's own record id, which is the only way to a playlist's clip.
+    fn cover(&mut self, backend: &Backend, on: bool, album: &str, artist: &str, title: Option<&str>, apple: Option<&str>) {
+        if !on || apple.is_none() && (album.is_empty() || artist.is_empty()) {
+            return;
+        }
+        let key = match apple {
+            Some(id) => format!("id:{id}"),
+            None => apple_key(album, artist, title),
+        };
+        if self.covers.contains_key(&key) {
+            return;
+        }
+        if self.missed.get(&key).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(300)) {
+            return;
+        }
+        if !self.waiting.insert(key.clone()) {
+            return;
+        }
+        backend.request(Req::AppleCover {
+            key,
+            album: album.to_owned(),
+            artist: artist.to_owned(),
+            title: title.map(str::to_owned),
+            record: apple.map(str::to_owned),
+        });
+    }
+
+    /// The newest frame of that sleeve, started the first time it's seen.
+    /// `None` until Apple has answered (or if it has no clip for the release).
+    fn sprite(&mut self, ctx: &egui::Context, on: bool, album: &str, artist: &str, title: Option<&str>, apple: Option<&str>, max_width: u32) -> Option<widgets::MotionSprite> {
+        if !on {
+            return None;
+        }
+        let key = match apple {
+            Some(id) => format!("id:{id}"),
+            None => apple_key(album, artist, title),
+        };
+        let url = self.covers.get(&key)?.clone()?;
+        self.clip(ctx, &url, max_width)
+    }
+
+    /// The newest frame of a motion clip, started the first time it's seen. The decoders
+    /// on screen are capped so old pages don't leave threads behind.
+    fn clip(&mut self, ctx: &egui::Context, url: &str, max_width: u32) -> Option<widgets::MotionSprite> {
+        // Never decode wider than the player's sleeve needs; frames and textures are
+        // sized by this, so it bounds the whole feature's memory.
+        let max_width = max_width.clamp(64, 640);
+        // A tile that scrolled away stops being asked for; its decoder goes soon after.
+        self.views.retain(|_, v| v.last_used.elapsed() < Duration::from_secs(6));
+        // One decoder per clip, keyed by its address: the songs of an album share its
+        // sleeve, and a view that restarted for each of them would never show a frame.
+        // The strip and the player ask for different sizes, and replacing it per caller
+        // would restart the clip every frame: a bigger view takes over only when it
+        // needs a wider decode.
+        let key = url.to_owned();
+        let stale = self.views.get(&key).map_or(true, |v| v.width < max_width);
+        if stale {
+            // At the cap, the least recently used view makes way for the new one.
+            if self.views.len() >= MOTION_VIEWS
+                && let Some(oldest) = self.views.iter().min_by_key(|(_, v)| v.last_used).map(|(k, _)| k.clone())
+            {
+                self.views.remove(&oldest);
+            }
+            self.views.insert(key.clone(), MotionView::new(crate::motion::play(ctx, url, max_width), max_width));
+        }
+        let view = self.views.get_mut(&key)?;
+        view.last_used = std::time::Instant::now();
+        let tex = view.texture(ctx)?;
+        Some(widgets::MotionSprite { id: tex.id(), size: tex.size_vec2() })
+    }
+
+    /// Put the sleeves down: decoders stopped, their frames and textures released.
+    fn clear(&mut self) {
+        self.views.clear();
+    }
+}
+
+/// What the music-video player has of the current song. Dropping the `MotionView` stops its
+/// decoder, so the picture ends with the mode.
+#[derive(Default)]
+pub struct Video {
+    /// The song a stream was asked for; an answer about a different one is dropped.
+    asked: Option<String>,
+    /// YouTube Music's answer for `asked`, waiting for the player to take it up.
+    stream: Option<crate::innertube::Video>,
+    /// Asked, and YouTube Music has nothing for this song: the artwork carries the player.
+    none: bool,
+    /// The picture running, and the song it belongs to.
+    view: Option<MotionView>,
+    id: Option<String>,
+    /// Where in the song the current picture was started: until the clip runs past it,
+    /// it is still catching up with the music and the two aren't compared.
+    anchor: Duration,
+    /// Times the clip has been restarted to catch the song up. A video shorter than its
+    /// song can be chased once or twice, and no further than that.
+    anchors: u8,
+    /// Where the song was on the last frame, so the listener's own seeking can be told
+    /// apart from the clip falling behind.
+    song: Duration,
+    /// When the player last said "no music video" — the note is shown for three seconds
+    /// of a song, then stops, so a song that has nothing doesn't keep saying it.
+    missed: Option<std::time::Instant>,
+}
+
+/// What the music-video player does about its picture on a given frame.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Nothing is running for this song: take up the answer and start it.
+    Start,
+    /// Leave it running exactly as it is.
+    Stay,
+    /// It has come apart from the song: run it from where the music is now.
+    Again,
+    /// Restarting hasn't helped either: the artwork carries the player from here.
+    End,
+}
+
+impl Video {
+    /// The rule the picture is held to, given one that is (`running`) or is not yet in
+    /// place. `clip` and `song` are how far each has got, and `anchor` is the point in
+    /// the song the clip was started at: until the clip runs past it, it is still inside
+    /// the download and the skip, so the two aren't compared. A paused song holds the
+    /// picture, so it can't be out of step either. Past a second and a half apart the
+    /// clip is restarted, and three restarts is as far as that is chased — a video
+    /// shorter than its song, or one with a lead-in of its own, would otherwise blink.
+    /// `dead` is a clip whose thread has finished without ever giving a frame: it isn't
+    /// catching up, it never arrived, so it is chased whatever its clock says.
+    fn step(&self, running: bool, playing: bool, clip: Duration, song: Duration, dead: bool) -> Step {
+        if !running {
+            return Step::Start;
+        }
+        if !playing || (!dead && (clip <= self.anchor || (clip.as_secs_f64() - song.as_secs_f64()).abs() < 1.5)) {
+            return Step::Stay;
+        }
+        if self.anchors >= 3 {
+            Step::End
+        } else {
+            Step::Again
+        }
+    }
+
+    /// Whether the song has just been moved by its listener: further than a second and a
+    /// half from where the last frame left it. Their own seeking is not the picture
+    /// falling behind, so it costs the chase nothing, and a clip that gave up on the song
+    /// gets its try back from the new place in it.
+    fn seeked(&mut self, song: Duration) -> bool {
+        let moved = (song.as_secs_f64() - self.song.as_secs_f64()).abs() > 1.5;
+        self.song = song;
+        moved
+    }
+
+    /// The mode is on and the picture is still on its way: YouTube Music has a clip of the
+    /// song, and the decoder has given no frame of it yet.
+    fn loading(&self) -> bool {
+        !self.none && self.view.as_ref().is_none_or(|v| v.motion.latest().is_none())
+    }
+
+    /// The picture on screen, once the decoder has given a frame.
+    fn frame(&mut self, ctx: &egui::Context) -> Option<widgets::MotionSprite> {
+        let tex = self.view.as_mut()?.texture(ctx)?;
+        Some(widgets::MotionSprite { id: tex.id(), size: tex.size_vec2() })
+    }
+
+    /// The same frame out of focus, for the column of words to sit over.
+    fn blurred(&mut self, ctx: &egui::Context) -> Option<widgets::MotionSprite> {
+        let tex = self.view.as_mut()?.blurred(ctx)?;
+        Some(widgets::MotionSprite { id: tex.id(), size: tex.size_vec2() })
+    }
+
+    /// The mode is off: the decoder stops, but the answer and the file it downloaded stay, so
+    /// pressing the key again on the same song is instant. A picture that gave up trying gets
+    /// its try back; one YouTube Music never had stays missing.
+    fn park(&mut self) {
+        (self.view, self.id, self.anchors) = (None, None, 0);
+        if self.stream.is_some() {
+            (self.none, self.missed) = (false, None);
+        }
+    }
+
+    /// Say once that there's nothing to show, and when. Being asked again on the same song
+    /// doesn't move the mark, so the note doesn't stay lit while the player keeps looking.
+    fn miss(&mut self) {
+        if self.missed.is_none() {
+            self.missed = Some(std::time::Instant::now());
+        }
+    }
+
+    /// The "no music video" note's own light: a full three seconds, then out with it. The
+    /// artwork is left to carry the player in silence, rather than a reason under it.
+    fn missing(&self) -> f32 {
+        match self.missed {
+            None => 0.0,
+            Some(t) => ((3.0 - t.elapsed().as_secs_f64()) * 2.0).clamp(0.0, 1.0) as f32,
+        }
+    }
+}
+
+/// Spotify's looping canvas for the song playing: asked for once per song, decoded like a
+/// music video and drawn over the sleeve. Session only — the clip is on disk by name.
+#[derive(Default)]
+pub struct Canvas {
+    /// The song the clip was asked for; an answer about another one is dropped.
+    asked: Option<String>,
+    /// The clip's file name and address, once Spotify has answered.
+    url: Option<(String, String)>,
+    view: Option<MotionView>,
+}
+
+impl Canvas {
+    /// The canvas on screen, once the decoder has given a frame.
+    fn frame(&mut self, ctx: &egui::Context) -> Option<widgets::MotionSprite> {
+        let tex = self.view.as_mut()?.texture(ctx)?;
+        Some(widgets::MotionSprite { id: tex.id(), size: tex.size_vec2() })
+    }
+
+    /// A new song: the old clip ends, and nothing is asked until asked for.
+    fn reset(&mut self) {
+        self.view = None;
+        self.url = None;
+    }
+}
+
+/// What can fill the sleeve, in the order the listener set: the first one the song has
+/// wins.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Picture {
+    Video,
+    Canvas,
+    Art,
+}
+
+impl Picture {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Video => "video",
+            Self::Canvas => "canvas",
+            Self::Art => "art",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Video => "Music video",
+            Self::Canvas => "Spotify canvas",
+            Self::Art => "Animated artwork",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        Some(match key.trim() {
+            "video" => Self::Video,
+            "canvas" => Self::Canvas,
+            "art" => Self::Art,
+            _ => return None,
+        })
     }
 }
 
@@ -303,6 +771,9 @@ pub struct App {
     /// The current page's request failed with nothing cached: show a retry, not a skeleton.
     load_failed: bool,
     search_text: String,
+    /// The search page's scope: false searches Apple Music online, true searches only
+    /// what's already here (library, uploads and history).
+    search_scope: bool,
     /// The route query the box was last filled from, so clearing it isn't undone.
     search_synced: String,
     /// Past searches, newest first, for the search landing.
@@ -324,7 +795,17 @@ pub struct App {
     // page data
     home: Option<HomeState>,
     home_loading: bool,
+    /// Explore's moods, which Home's mood tile plays as a station.
+    moods: Vec<crate::ytm::Mood>,
+    moods_loading: bool,
+    /// The mood Home offers now: one of `moods`, chosen when they arrive and kept for
+    /// the run, so the tile doesn't change under the pointer.
+    mood: Option<crate::ytm::Mood>,
+    /// A mood station is being built: its tile doesn't answer twice while it loads.
+    mood_loading: bool,
     explore: Option<Explore>,
+    /// The section whose name was clicked: everything it holds, on its own page.
+    see_all: Option<Shelf>,
     search: Option<SearchResults>,
     /// Albums and playlists opened lately, so going back to one shows it at once (and
     /// refreshes it quietly), and their loads under way.
@@ -366,8 +847,23 @@ pub struct App {
     normalize: bool,
     log_volume: bool,
     high_quality: bool,
+    /// Send lossless tracks straight to the selected DAC in WASAPI exclusive mode.
+    bit_perfect: bool,
     /// Play an official music video as its song version when one is found.
     play_songs: bool,
+    /// A song whose own name says AI made it is skipped rather than played.
+    skip_ai: bool,
+    /// Ask YouTube Music for the music video at up to 1080p rather than 720p.
+    video_hd: bool,
+    /// The song's music video stands behind the player as it opens, rather than only
+    /// when the V key is pressed.
+    video_bg: bool,
+    /// The order each library tab puts its rows in.
+    lib_sort: LibSort,
+    /// The Songs tab's rows as indices into the liked list, kept so a few thousand
+    /// songs aren't sorted again on every frame. Tagged with the sort and the list it
+    /// was made from; anything else and it's rebuilt.
+    lib_rows: Option<(String, Vec<usize>)>,
     /// The song version playing in place of the current music video.
     playing_as: Option<PlayingAs>,
     /// The output device picked in settings (cpal's id and its name, for when it's not
@@ -380,17 +876,30 @@ pub struct App {
     // visuals
     art_key: Option<String>,
     art_changed: f64,
+    /// The playing song's blurred sleeve, kept for the frosted bars (`shell::frost`).
+    frost_art: Option<(String, Vec<u8>)>,
+    /// The opened page's own blurred sleeve, keyed by the page it belongs to: an album
+    /// or playlist washes its background with the cover it shows.
+    page_art: Option<(String, Vec<u8>)>,
+    /// Which page asked for its sleeve and when, so a silent failure is asked again.
+    page_art_asked: Option<(String, f64)>,
+    /// The desktop as it looks behind the mini card, blurred: the card's ground while
+    /// mini mode is on.
+    backdrop: backdrop::Backdrop,
     /// Apple's page for each artist visited (their display name and hero clips).
     apple_artists: std::collections::HashMap<String, Option<crate::apple::Artwork>>,
-    /// Motion sleeve master playlist per release key (`None`: Apple has none).
-    apple_covers: std::collections::HashMap<String, Option<String>>,
-    /// Releases Apple had nothing for when last asked, and when: asked again after a
-    /// while, since a lookup can fail on a network hiccup rather than for good.
-    apple_missed: std::collections::HashMap<String, std::time::Instant>,
-    /// Decoders for the motion sleeves on screen.
-    apple_motion: std::collections::HashMap<String, MotionView>,
-    /// Apple lookups already in flight.
-    apple_waiting: std::collections::HashSet<String>,
+    /// Apple's moving artwork: which releases have a sleeve, which lookups are in flight
+    /// or cooling, and the decoders running. All one field, so a page can ask its tiles
+    /// for sleeves while its own feed — a different field — stays borrowed as it draws.
+    apple: AppleArt,
+    /// Apple's browse shelves, by the page path they came from (`new`, `radio`).
+    apple_shelves: std::collections::HashMap<String, Vec<crate::apple::Shelf>>,
+    /// Apple browse pages asked for and not yet answered.
+    apple_feeds: std::collections::HashSet<String>,
+    /// Apple's own collection pages, by the address they came from.
+    apple_collections: std::collections::HashMap<String, crate::apple::Collection>,
+    /// Apple collection pages asked for and not yet answered.
+    apple_collection_waiting: std::collections::HashSet<String>,
     /// Settings › Artist pages: the listener's own signature service, or empty.
     signature_api: String,
     /// Signatures already uploaded, by name key (`artist_signature::key`).
@@ -433,14 +942,33 @@ pub struct App {
     /// Light or dark pages (the ytm-rs theme's; see `light_pages`).
     appearance: theme::Appearance,
     anim_bg: bool,
+    page_blobs: bool,
     reactive_bg: bool,
+    /// Power saver: the shader blurs behind pages and the player stand down for a flat
+    /// ambient tint, which costs an integrated GPU almost nothing.
+    pub disable_blur: bool,
     /// Apple's moving album art. Off unless asked for: a sleeve needs a decoder, a
     /// frame and a texture each, and they add up while the music plays.
     animated_artwork: bool,
+    /// The Best Part button on the artwork: one touch to where people replay most.
+    show_best_part: bool,
+    /// The volume slider, in the bar and under the transport. Some keyboards and small
+    /// screens want the room back.
+    show_volume: bool,
+    /// Sing along: tune the centre vocal out of the mix.
+    sing: bool,
+    /// How much of it to take out, 0..1.
+    sing_level: f32,
+    /// Whether the marks take the song's colour or keep the app's own.
+    icon_tint: bool,
     /// Skip the parts of music videos SponsorBlock marks as not music.
     sponsorblock: bool,
     /// Crossfade between songs, and over how many seconds.
     crossfade: bool,
+    /// The equalizer: whether it's on, its bands (dB) and whether it keeps clear of clipping.
+    eq_on: bool,
+    eq_gains: crate::audio::eq::Gains,
+    eq_no_clip: bool,
     /// DJ-style handoff: the next song eases in under the last one (see `audio::Ramp`).
     automix: bool,
     crossfade_secs: u32,
@@ -452,6 +980,20 @@ pub struct App {
     mix_from: Option<MixFrom>,
     /// SponsorBlock segments for a video, and when one was last skipped.
     segments: Option<(String, Vec<crate::sponsorblock::Segment>)>,
+    /// youtube.com's "Most replayed" curve for each song asked about (`None`: the video
+    /// has none, which is an answer worth remembering for a week).
+    curves: HashMap<String, Option<crate::bestpart::Heatmap>>,
+    /// Songs whose curve is already on its way, so a redraw doesn't ask twice.
+    curves_asked: std::collections::HashSet<String>,
+    /// Where the playing song's best part starts, and which song that is: a late answer
+    /// about the last one must not mark this one.
+    best_part: Option<(String, crate::bestpart::Start)>,
+    /// The playing song's best part has gone past: heard once, the button is put away.
+    /// Reset with the song, so playing it again offers the jump again.
+    best_part_heard: bool,
+    /// YouTube's own word that AI made a song, by video id: the watch page's "Made with
+    /// AI" block, asked for when the skip is on and kept for the session.
+    ai_flags: HashMap<String, bool>,
     segment_skipped: f64,
     /// Background animation clock: advances only while music plays, so pausing
     /// freezes the motion instead of jumping when resumed.
@@ -474,19 +1016,40 @@ pub struct App {
     np_open: bool,
     np_tab: NpTab,
     queue_open: bool,
+    /// The lyrics drawer beside the page: the words without leaving what you were
+    /// looking at, the way the reference's own lyric pane works.
+    lyrics_open: bool,
+    /// The queue panel has scrolled to the playing row for this panel-and-song pair:
+    /// what came before stands above it, to be scrolled back to.
+    queue_seed: Option<String>,
     fullscreen: bool,
+    /// The music-video player: the song's music video, full screen, with the words beside it.
+    video_on: bool,
+    video: Video,
+    /// Spotify's Canvas setting, and the clip it found for the song playing.
+    show_canvas: bool,
+    /// The two lines already sung stay above the one being sung (am-lyrics' own sheet).
+    pub show_past_lines: bool,
+    canvas: Canvas,
+    /// The order the sleeve tries its pictures in.
+    pub picture_order: [Picture; 3],
     /// The mini player: the window shrunk to a strip.
     mini: mini::Mini,
     /// Every source's lyrics for the current song (by video ID).
     lyrics: Option<(String, LyricsSet)>,
+    /// Distinguishes repeated requests for the same song.
+    lyrics_generation: u64,
     /// Romanization/translation for one source's lines: (video ID, source key, language, extras).
     lyrics_extras: Option<(String, String, String, crate::translate::Extras)>,
+    lyrics_share: Option<lyrics_share::LyricsShare>,
     /// The extras last asked for, so each is requested once.
     extras_asked: Option<(String, String, String)>,
     show_roman: bool,
     show_trans: bool,
     lyric_prefs: lyric_prefs::Prefs,
     lyric_view: karaoke::View,
+    /// The drawer has its own scroll, timing and texture state.
+    sidebar_lyric_view: karaoke::View,
     lyric_clock: lyric_prefs::Clock,
     /// Rotation of a "record" cover (radians); advances only while playing.
     record_angle: f64,
@@ -543,13 +1106,21 @@ pub struct App {
     good_window: Option<String>,
     /// The sidebar is a narrow icon rail.
     sidebar_collapsed: bool,
+    /// Which sidebar groups are unfolded.
+    library_open: bool,
+    playlists_open: bool,
     /// The sidebar playlists' order (by id), and the ones hidden from it.
     playlist_order: Vec<String>,
     hidden_playlists: HashSet<String>,
+    /// Artists starred from their page's hero.
+    fav_artists: HashSet<String>,
     /// The collection page whose inline search is open, and what's typed in it.
     coll_search: Option<(String, String)>,
     /// What's typed in the box above Settings; the page keeps only what it matches.
     settings_search: String,
+    /// A Spotify `sp_dc` cookie typed in but not yet saved. Never written to storage, and
+    /// cleared once it reaches the vault.
+    sp_token: String,
     /// The keyboard shortcuts, with what the user changed over the defaults.
     keys: keys::Map,
     /// The shortcut row waiting for a key, if one is being recorded.
@@ -570,6 +1141,15 @@ pub struct App {
 
 /// Longest crossfade offered, in seconds.
 pub(super) const CROSSFADE_MAX: u32 = 12;
+
+/// The equalizer's bands as saved: ten comma-separated dB values.
+fn parse_gains(s: &str) -> Option<crate::audio::eq::Gains> {
+    let mut out = [0.0; 10];
+    for (o, part) in out.iter_mut().zip(s.split(',')) {
+        *o = part.trim().parse().ok()?;
+    }
+    Some(out)
+}
 
 /// The song an Automix handoff came from. Its last stretch is still what you hear
 /// while the next one eases in, so the player keeps showing it (with its art and
@@ -599,12 +1179,12 @@ impl App {
         let get = |k: &str| storage.and_then(|s| s.get_string(k));
         // Dev hook: YTM_FONT=<font name> tries a font without saving it.
         theme::set_font_choice(&dev_var("YTM_FONT").map(str::to_owned).or_else(|| get("font")).unwrap_or_default());
-        let discord_enabled = get("discord_enabled").is_none_or(|v| v == "1");
         let app_icon = crate::appicon::load(backend.data_dir());
         let wgpu_renderer = crate::renderer::load(backend.data_dir()) == crate::renderer::Renderer::Wgpu;
-        // Updates reinstall the shortcuts with the classic icon: always put ours back,
-        // and keep the Start menu link pointing at this exe.
-        crate::appicon::sync_shortcuts(app_icon, backend.data_dir());
+        // Isolated dev profiles must not rewrite the user's Start menu shortcut.
+        if std::env::var_os("YTM_DATA_DIR").is_none() && std::env::var_os("YTM_NO_SHORTCUT_SYNC").is_none() {
+            crate::appicon::sync_shortcuts(app_icon, backend.data_dir());
+        }
         crate::downloads::init(backend.data_dir(), &get("download_dir").unwrap_or_default());
         crate::lastfm::init(backend.data_dir());
         let logged_in = backend.is_logged_in();
@@ -630,6 +1210,7 @@ impl App {
             crate::transfer::Transfer::new(backend.data_dir(), Arc::new(move || b.wake()))
         };
         let discord_prefs = crate::discord::Prefs::load(&get);
+        let discord_enabled = get("discord_enabled").is_none_or(|v| v == "1");
         let discord = discord_enabled.then(crate::discord::Discord::spawn).flatten();
         if let Some(d) = &discord {
             d.set_prefs(discord_prefs.clone());
@@ -662,6 +1243,7 @@ impl App {
             loading: false,
             load_failed: false,
             search_text: String::new(),
+            search_scope: false,
             search_synced: String::new(),
             recent_searches: get("recent_searches").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default(),
             search_pending: false,
@@ -673,7 +1255,12 @@ impl App {
             suggest_due: None,
             home: None,
             home_loading: true,
+            moods: Vec::new(),
+            moods_loading: false,
+            mood: None,
+            mood_loading: false,
             explore: None,
+            see_all: None,
             search: None,
             lists: Lists::default(),
             artist: None,
@@ -704,7 +1291,15 @@ impl App {
             normalize: get("normalize").is_none_or(|v| v == "1"),
             log_volume: get("log_volume").is_none_or(|v| v == "1"),
             high_quality: get("high_quality").is_none_or(|v| v == "1"),
+            bit_perfect: get("bit_perfect").is_some_and(|v| v == "1"),
             play_songs: get("play_songs").is_none_or(|v| v == "1"),
+            skip_ai: get("skip_ai").is_some_and(|v| v == "1"),
+            // 720p by default: a clip is downloaded whole before its first frame, and the
+            // 1080p file is three times the bytes for a picture the sleeve scales anyway.
+            video_hd: get("video_hd").is_some_and(|v| v == "1"),
+            video_bg: get("video_bg").is_some_and(|v| v == "1"),
+            lib_sort: LibSort::read(get("lib_sort").as_deref()),
+            lib_rows: None,
             playing_as: None,
             output_device: get("output_device").filter(|d| !d.is_empty()).map(|id| (id, get("output_device_name").unwrap_or_default())),
             output_devices: Vec::new(),
@@ -717,10 +1312,14 @@ impl App {
             window_hidden: false,
             good_window: get("window"),
             sidebar_collapsed: get("sidebar_collapsed").is_some_and(|v| v == "1"),
+            library_open: true,
+            playlists_open: true,
             playlist_order: get("playlist_order").map(|v| v.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect()).unwrap_or_default(),
             hidden_playlists: get("hidden_playlists").map(|v| v.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect()).unwrap_or_default(),
+            fav_artists: get("fav_artists").map(|v| v.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect()).unwrap_or_default(),
             coll_search: None,
             settings_search: String::new(),
+            sp_token: String::new(),
             keys: keys::Map::default(),
             keys_edit: None,
             jam_server: String::new(),
@@ -751,11 +1350,16 @@ impl App {
             radio_pending: false,
             seek_drag: None,
             art_key: None,
+            frost_art: None,
+            page_art: None,
+            page_art_asked: None,
+            backdrop: Default::default(),
             apple_artists: Default::default(),
-            apple_covers: Default::default(),
-            apple_missed: Default::default(),
-            apple_motion: Default::default(),
-            apple_waiting: Default::default(),
+            apple: Default::default(),
+            apple_shelves: Default::default(),
+            apple_feeds: Default::default(),
+            apple_collections: Default::default(),
+            apple_collection_waiting: Default::default(),
             signature_api: get("signature_api").unwrap_or_default(),
             signature_tex: Default::default(),
             signature_images: Default::default(),
@@ -781,16 +1385,33 @@ impl App {
             // Dev hook: YTM_APPEARANCE=light|dark|system tries a mode without saving it.
             appearance: theme::Appearance::from_key(&dev_var("YTM_APPEARANCE").map(str::to_owned).or_else(|| get("appearance")).unwrap_or_default()),
             anim_bg: get("anim_bg").is_none_or(|v| v == "1"),
+            page_blobs: get("page_blobs").is_some_and(|v| v == "1"),
             reactive_bg: get("reactive_bg").is_none_or(|v| v == "1"),
-            animated_artwork: get("animated_artwork").is_some_and(|v| v == "1"),
+            disable_blur: get("disable_blur").is_some_and(|v| v == "1"),
+            animated_artwork: get("animated_artwork").is_none_or(|v| v == "1"),
+            show_best_part: get("show_best_part").is_none_or(|v| v == "1"),
+            show_volume: get("show_volume").is_none_or(|v| v == "1"),
+            // Never restored: singing along is something the listener asks for, so the
+            // karaoke cut starts off every launch even if it was left on when last quit.
+            sing: false,
+            sing_level: 1.0,
+            icon_tint: get("icon_tint").is_none_or(|v| v == "1"),
             sponsorblock: get("sponsorblock").is_some_and(|v| v == "1"),
             crossfade: get("crossfade").is_some_and(|v| v == "1"),
+            eq_on: get("eq").is_some_and(|v| v == "1"),
+            eq_gains: get("eq_gains").and_then(|v| parse_gains(&v)).unwrap_or_default(),
+            eq_no_clip: get("eq_no_clip").is_none_or(|v| v == "1"),
             automix: get("automix").is_some_and(|v| v == "1"),
             handoff: false,
             pending_mix: None,
             mix_from: None,
             crossfade_secs: get("crossfade_secs").and_then(|v| v.parse().ok()).unwrap_or(5).clamp(1, CROSSFADE_MAX),
             segments: None,
+            curves: Default::default(),
+            curves_asked: Default::default(),
+            best_part: None,
+            best_part_heard: false,
+            ai_flags: HashMap::new(),
             segment_skipped: f64::NEG_INFINITY,
             bg_time: 0.0,
             last_frame: 0.0,
@@ -804,15 +1425,39 @@ impl App {
             np_open: false,
             np_tab: if get("np_art").is_some_and(|v| v == "1") { NpTab::Art } else { NpTab::Lyrics },
             queue_open: false,
+            lyrics_open: false,
+            queue_seed: None,
             fullscreen: false,
+            video_on: false,
+            video: Default::default(),
+            // Off unless asked for: a clip comes from Spotify, so the listener opts in.
+            show_canvas: get("show_canvas").is_some_and(|v| v == "1"),
+            show_past_lines: get("show_past_lines").is_none_or(|v| v == "1"),
+            canvas: Default::default(),
+            picture_order: {
+                let mut order: Vec<Picture> = get("picture_order")
+                    .unwrap_or_else(|| "video,canvas,art".to_owned())
+                    .split(',')
+                    .filter_map(Picture::from_key)
+                    .collect();
+                for p in [Picture::Video, Picture::Canvas, Picture::Art] {
+                    if !order.contains(&p) {
+                        order.push(p);
+                    }
+                }
+                [order[0], order[1], order[2]]
+            },
             mini: mini::Mini::load(get),
             lyrics: None,
+            lyrics_generation: 0,
             lyrics_extras: None,
+            lyrics_share: None,
             extras_asked: None,
             show_roman: get("show_roman").is_none_or(|v| v == "1"),
             show_trans: get("show_trans").is_none_or(|v| v == "1"),
             lyric_prefs: lyric_prefs::Prefs::load(&get),
             lyric_view: Default::default(),
+            sidebar_lyric_view: Default::default(),
             lyric_clock: Default::default(),
             record_angle: 0.0,
             logged_in,
@@ -827,6 +1472,11 @@ impl App {
             smoke: None,
         };
         app.request_liked(false);
+        app.audio.send(crate::audio::AudioCmd::SetBitPerfect(app.bit_perfect));
+        if app.bit_perfect {
+            // Bit-perfect output carries stereo PCM; ask the sources for the stereo copy.
+            app.backend.set_prefer_atmos(false);
+        }
         // Dev hooks: YTM_SMOKE="query" searches and plays the first song ("id:<videoId>[,<videoId>…]"
         // plays that video); YTM_SEARCH
         // only searches; YTM_PAGE opens a page; YTM_NOWPLAYING opens the overlay.
@@ -836,17 +1486,27 @@ impl App {
         let smoke = std::env::var("YTM_SMOKE").ok().filter(|q| !q.is_empty());
         if let Some(ids) = smoke.as_deref().and_then(|q| q.strip_prefix("id:")) {
             // "id:a,b,c" queues several.
-            let track = |id: &str| Track { id: id.to_owned(), title: id.to_owned(), artists: vec![], album: None, duration: None, thumbs: vec![], track_nr: None, plays: None, music_video: false };
+            let track = |id: &str| Track { id: id.to_owned(), title: id.to_owned(), artists: vec![], album: None, duration: None, thumbs: vec![], track_nr: None, plays: None, music_video: false, episode: false };
             app.play_list(ids.split(',').map(track).collect(), 0);
         } else if let Some(q) = smoke {
             app.go(Page::Search(q.clone()));
             app.smoke = Some(q);
         } else if let Some(q) = std::env::var("YTM_SEARCH").ok().filter(|q| !q.is_empty()) {
             app.go(Page::Search(q));
+        } else if let Some(q) = std::env::var("YTM_SUGGESTIONS").ok().filter(|q| !q.is_empty()) {
+            // The dropdown, on screen: the box holds the query and keeps its focus, so
+            // the suggestions it earns are there to screenshot.
+            app.go(Page::Search(String::new()));
+            app.search_text = q;
+            app.search_refocus = true;
+            // Without the OS's focus there's no gained_focus to arm the ask, so arm it here.
+            app.suggest_due = Some(0.0);
         }
         match std::env::var("YTM_PAGE").as_deref() {
             Ok("home") => app.go(Page::Home),
             Ok("new") | Ok("explore") => app.go(Page::New),
+            Ok("artists") => app.go(Page::Library(LibTab::Artists)),
+            Ok("albums") => app.go(Page::Library(LibTab::Albums)),
             Ok("library") => app.go(Page::Library(LibTab::Playlists)),
             Ok("uploads") => app.go(Page::Library(LibTab::Uploads)),
             Ok("liked") => app.go(Page::Library(LibTab::Songs)),
@@ -857,6 +1517,7 @@ impl App {
             Ok(p) if p.starts_with("album:") => app.go(Page::Album(p[6..].to_owned())),
             Ok(p) if p.starts_with("artist:") => app.go(Page::Artist(p[7..].to_owned())),
             Ok(p) if p.starts_with("playlist:") => app.go(Page::Playlist(p[9..].to_owned())),
+            Ok(p) if p.starts_with("apple:") => app.go(Page::AppleCollection(p[6..].to_owned())),
             _ => {}
         }
         // YTM_UPLOAD=<file> uploads that file as if it had been picked.
@@ -889,9 +1550,16 @@ impl App {
         if std::env::var_os("YTM_QUEUE").is_some() {
             app.queue_open = true;
         }
+        // Dev hook: YTM_SING engages Sing along with the bar out.
+        if std::env::var_os("YTM_SING").is_some() {
+            app.sing = true;
+            app.np_tab = NpTab::Lyrics;
+        }
         jam::dev_hooks(&mut app);
         app.audio.set_normalize(app.normalize);
+        app.set_eq();
         app.set_crossfade();
+        app.set_sing();
         app
     }
 
@@ -905,7 +1573,7 @@ impl App {
             return;
         }
         // Leaving a page deloads its motion clips: no decoder keeps running unseen.
-        self.apple_motion.clear();
+        self.apple.clear();
         let prev = std::mem::replace(&mut self.page, page);
         self.back.push(prev);
         self.forward.clear();
@@ -916,7 +1584,7 @@ impl App {
         if self.np_open {
             self.np_open = false;
         } else if let Some(p) = self.back.pop() {
-            self.apple_motion.clear();
+            self.apple.clear();
             self.forward.push(std::mem::replace(&mut self.page, p));
             self.page_loaded();
         }
@@ -924,7 +1592,7 @@ impl App {
 
     fn nav_forward(&mut self) {
         if let Some(p) = self.forward.pop() {
-            self.apple_motion.clear();
+            self.apple.clear();
             self.back.push(std::mem::replace(&mut self.page, p));
             self.page_loaded();
         }
@@ -943,8 +1611,10 @@ impl App {
     /// showing the cached copy meanwhile.
     fn page_loaded(&mut self) {
         self.page_changed = -1.0; // stamped with the frame time on the next pass
-        // Any section opened inside Settings is left behind with the page.
+        // The room opened from Listen is left behind with the page; the rail keeps the
+        // category you last chose.
         self.jam_open = false;
+        self.sp_token.clear();
         // The search box holds the query of the search page you're on, and is empty elsewhere.
         self.search_synced = match &self.page {
             Page::Search(q) => q.clone(),
@@ -960,19 +1630,34 @@ impl App {
         if let Some(id) = self.page_list().map(str::to_owned) {
             self.lists.move_to_front(&id);
         }
+        // The landing is the empty search: Apple's category bricks, and nothing else.
+        if matches!(&self.page, Page::Search(q) if q.trim().is_empty()) {
+            self.ask_apple_feed("gb/search");
+        }
         let req = match &self.page.clone() {
             Page::Home if !self.home_loading => {
                 self.home_loading = true;
+                // The mood tile needs Explore's mood list, which comes once per run.
+                if self.moods.is_empty() && !self.moods_loading {
+                    self.moods_loading = true;
+                    self.backend.request(Req::Moods);
+                }
                 Some(Req::Home(None))
             }
             Page::New => Some(Req::Explore(self.preferred_artist_ids())),
             // The empty search is the page's landing state: nothing to ask for.
-            Page::Search(q) if !q.trim().is_empty() && self.search.as_ref().is_none_or(|s| &s.query != q) => Some(Req::Search(q.clone())),
+            Page::Search(q) if !q.trim().is_empty() && !self.search_scope && self.search.as_ref().is_none_or(|s| &s.query != q) => Some(Req::Search(q.clone())),
             Page::Album(id) | Page::Playlist(id) => {
-                self.visit_list(id, matches!(self.page, Page::Album(_)));
+                if id != LIKED_MUSIC || self.logged_in {
+                    self.visit_list(id, matches!(self.page, Page::Album(_)));
+                }
                 None
             }
             Page::Artist(id) => Some(Req::Artist(id.clone())),
+            Page::AppleCollection(url) => {
+                self.ask_apple_collection(url);
+                None
+            }
             Page::Library(LibTab::History) if self.logged_in => Some(Req::History),
             Page::Library(LibTab::Uploads) if self.logged_in => Some(Req::Uploads),
             Page::Library(LibTab::Songs) => {
@@ -990,6 +1675,7 @@ impl App {
             Page::New => self.explore.is_some(),
             Page::Album(id) | Page::Playlist(id) => self.opened(id).is_some(),
             Page::Artist(id) => self.artist.as_ref().is_some_and(|a| &a.id == id),
+            Page::AppleCollection(url) => self.apple_collections.contains_key(url),
             Page::Library(LibTab::History) => self.history.is_some(),
             Page::Library(LibTab::Uploads) => self.uploads.is_some(),
             Page::Library(LibTab::Songs) => self.opened(LIKED_MUSIC).is_some(),
@@ -1006,6 +1692,23 @@ impl App {
         }
     }
 
+    /// Apple's shelves for one of its browse pages, asked once per visit: `path` is
+    /// Apple's own (`gb/new`, `gb/search`), so each page keeps its storefront.
+    fn ask_apple_feed(&mut self, path: &str) {
+        if self.apple_shelves.contains_key(path) || !self.apple_feeds.insert(path.to_owned()) {
+            return;
+        }
+        self.backend.request(Req::AppleFeed(path.to_owned()));
+    }
+
+    /// Apple's own collection page, asked once per address.
+    fn ask_apple_collection(&mut self, url: &str) {
+        if self.apple_collections.contains_key(url) || !self.apple_collection_waiting.insert(url.to_owned()) {
+            return;
+        }
+        self.backend.request(Req::AppleCollection { url: url.to_owned() });
+    }
+
     /// The album or playlist the page shows (the Library's liked songs are Liked Music).
     fn page_list(&self) -> Option<&str> {
         match &self.page {
@@ -1015,46 +1718,26 @@ impl App {
         }
     }
 
-    /// Ask Apple, once, for the motion sleeve of a release: `title` names the song whose
-    /// sleeve is wanted, `None` asks for the release `album` itself.
-    fn apple_cover(&mut self, album: &str, artist: &str, title: Option<&str>) {
-        if !self.animated_artwork || album.is_empty() || artist.is_empty() {
-            return;
-        }
-        let key = apple_key(album, artist, title);
-        if self.apple_covers.contains_key(&key) {
-            return;
-        }
-        if self.apple_missed.get(&key).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(300)) {
-            return;
-        }
-        if !self.apple_waiting.insert(key.clone()) {
-            return;
-        }
-        self.backend.request(Req::AppleCover {
-            key,
-            album: album.to_owned(),
-            artist: artist.to_owned(),
-            title: title.map(str::to_owned),
-        });
+    /// Ask Apple, once, for the motion sleeve of a release. `title` names the song whose
+    /// sleeve is wanted and `None` asks for the release `album` itself; `apple` is
+    /// Apple's own record id, which is the only way to a playlist's clip.
+    fn apple_cover(&mut self, album: &str, artist: &str, title: Option<&str>, apple: Option<&str>) {
+        let on = self.animated_artwork;
+        self.apple.cover(&self.backend, on, album, artist, title, apple);
     }
 
     /// The newest frame of that sleeve, started the first time it's seen.
     /// `None` until Apple has answered (or if it has no clip for the release).
-    fn apple_sprite(&mut self, ctx: &egui::Context, album: &str, artist: &str, title: Option<&str>, max_width: u32) -> Option<widgets::MotionSprite> {
-        if !self.animated_artwork {
-            return None;
-        }
-        let key = apple_key(album, artist, title);
-        let url = self.apple_covers.get(&key)?.clone()?;
-        self.motion_sprite(ctx, &url, max_width)
+    fn apple_sprite(&mut self, ctx: &egui::Context, album: &str, artist: &str, title: Option<&str>, apple: Option<&str>, max_width: u32) -> Option<widgets::MotionSprite> {
+        let on = self.animated_artwork;
+        self.apple.sprite(ctx, on, album, artist, title, apple, max_width)
     }
 
     /// Put the motion sleeves down: decoders stopped, their frames and textures released.
     /// What a song costs while it plays is worth handing back once it has ended, or as
     /// soon as the setting says the art shouldn't move.
     fn deload_motion(&mut self) {
-        self.apple_motion.clear();
+        self.apple.clear();
     }
 
     /// The artist's handwritten signature, from the service in Settings: asked for once
@@ -1117,35 +1800,14 @@ impl App {
     /// The newest frame of a motion clip, started the first time it's seen. The decoders
     /// on screen are capped so old pages don't leave threads behind.
     fn motion_sprite(&mut self, ctx: &egui::Context, url: &str, max_width: u32) -> Option<widgets::MotionSprite> {
-        // Never decode wider than the player's sleeve needs; frames and textures are
-        // sized by this, so it bounds the whole feature's memory.
-        let max_width = max_width.clamp(64, 640);
-        // A tile that scrolled away stops being asked for; its decoder goes soon after.
-        self.apple_motion.retain(|_, v| v.last_used.elapsed() < Duration::from_secs(6));
-        // One decoder per clip, keyed by its address: the songs of an album share its
-        // sleeve, and a view that restarted for each of them would never show a frame.
-        // The strip and the player ask for different sizes, and replacing it per caller
-        // would restart the clip every frame: a bigger view takes over only when it
-        // needs a wider decode.
-        let key = url.to_owned();
-        let stale = self.apple_motion.get(&key).map_or(true, |v| v.width < max_width);
-        if stale {
-            // At the cap, the least recently used view makes way for the new one.
-            if self.apple_motion.len() >= MOTION_VIEWS
-                && let Some(oldest) = self.apple_motion.iter().min_by_key(|(_, v)| v.last_used).map(|(k, _)| k.clone())
-            {
-                self.apple_motion.remove(&oldest);
-            }
-            self.apple_motion.insert(key.clone(), MotionView::new(crate::motion::play(ctx, url, max_width), max_width));
-        }
-        let view = self.apple_motion.get_mut(&key)?;
-        view.last_used = std::time::Instant::now();
-        let tex = view.texture(ctx)?;
-        Some(widgets::MotionSprite { id: tex.id(), size: tex.size_vec2() })
+        self.apple.clip(ctx, url, max_width)
     }
 
     fn accent_color(&self) -> Color32 {
-        let c = self.look().accent(self.accent);
+        // With the icon tint off, a preset that borrows the cover's colour keeps the app's
+        // own red instead; a preset that names its own colour is untouched by the switch.
+        let untinted = !self.icon_tint && self.look().accent == "cover";
+        let c = if untinted { theme::RED } else { self.look().accent(self.accent) };
         if theme::light() {
             // A pale cover colour would barely show on light pages: deepen it.
             let luma = 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
@@ -1175,10 +1837,10 @@ impl App {
         }
     }
 
-    /// Height of the bottom player area: the capsule's 56 points plus the margin it
-    /// floats on.
+    /// Height of the bottom player area: the 52-point pill, the 20 it floats above the
+    /// edge on, and a little more for its shadow.
     fn bar_height(&self) -> f32 {
-        86.0
+        78.0
     }
 
     fn toast(&mut self, msg: impl Into<String>) {
@@ -1194,6 +1856,7 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         dev_pace();
         self.lyric_view.release_hidden(ctx.cumulative_pass_nr());
+        self.sidebar_lyric_view.release_hidden(ctx.cumulative_pass_nr());
         let now = ctx.input(|i| i.time);
         self.sync_look();
         self.pump(now);
@@ -1292,13 +1955,10 @@ impl eframe::App for App {
             }
         } else if self.np_open && playing && !self.mini.busy() {
             ctx.request_repaint_after(Duration::from_millis(33));
-        } else if playing && self.mini.showing() && self.mini.lyrics {
-            // The band's line lights word by word; four frames a second reads as a lag.
-            ctx.request_repaint_after(Duration::from_millis(33));
         } else if playing && widgets::equalizer_shown(ctx) {
             // The playing row's bars need a steady, full rate to read as smooth.
             ctx.request_repaint_after(Duration::from_millis(16));
-        } else if playing && self.anim_bg && shell::pages_bg_moves(self.look()) {
+        } else if playing && self.page_blobs && self.anim_bg && !self.disable_blur && shell::pages_bg_moves(self.look()) {
             ctx.request_repaint_after(Duration::from_millis(66));
         } else if playing || self.buffering {
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -1315,6 +1975,32 @@ impl eframe::App for App {
         let look = self.look();
         // Now playing is dark; once it's most of the way up, so is the player bar under it.
         let np = theme::anim_bool(&ctx, "np-open", self.np_open && self.current().is_some(), 0.42);
+        // The picture belongs to the player: it ends when the player goes down, and the
+        // decoder stops with it rather than running a clip nothing is showing. What it
+        // returns to is the setting, so the V key is a hand on the same light.
+        if np <= 0.001 {
+            self.video_on = self.video_bg;
+        }
+        if !self.video_on {
+            self.video.park();
+        }
+        // Dev hook: YTM_VIDEO=<secs> turns the music-video player on from that moment, so
+        // a capture shows the picture without a keyboard in the room. Once, so a later
+        // hook can still put the words away.
+        if dev_var("YTM_VIDEO").and_then(|v| v.parse::<f64>().ok()).is_some_and(|t| now >= t) {
+            let done = egui::Id::unique("dev-video-on");
+            if !ctx.data(|d| d.get_temp::<bool>(done).unwrap_or(false)) {
+                ctx.data_mut(|d| d.insert_temp(done, true));
+                self.video_on = true;
+                self.np_open = true;
+                self.np_tab = NpTab::Lyrics;
+            }
+        }
+        // Dev hook: YTM_FULLSCREEN=<secs> takes the window full screen from that moment,
+        // the way the key does, so a capture of the full-screen layout is the real thing.
+        if dev_var("YTM_FULLSCREEN").and_then(|v| v.parse::<f64>().ok()).is_some_and(|t| now >= t) && !self.fullscreen {
+            self.set_fullscreen(&ctx, true);
+        }
         let light = self.light_pages(&ctx) && np < 0.5 && !self.fullscreen;
         theme::set_mode(&ctx, light);
         if self.chrome_applied.as_deref() != Some(look.id.as_str()) {
@@ -1326,6 +2012,9 @@ impl eframe::App for App {
         }
         let accent = self.accent_color();
         ctx.data_mut(|d| d.insert_temp(egui::Id::unique("accent"), accent));
+        // The full-screen player always keeps the sung lines: its sheet is the whole
+        // picture, and the setting only trims the panels.
+        ctx.data_mut(|d| d.insert_temp(egui::Id::unique("lyrics-past"), self.show_past_lines || self.fullscreen));
         let app_style = &look.app;
         // Once now playing has slid all the way up it hides everything but the player
         // bar, so the pages and the full-screen background under it aren't drawn.
@@ -1366,13 +2055,14 @@ impl eframe::App for App {
             use crate::preset::SidebarStyle;
             let side_alpha = app_style.sidebar_alpha.clamp(0.0, 1.0);
             // The logo's row is 32 points tall.
-            let side_margin = egui::Margin { left: 14, right: 14, top: titlebar::top_margin(16, 32.0), bottom: 16 };
+            let side_margin = egui::Margin { left: 16, right: 16, top: titlebar::top_margin(16, 32.0), bottom: 16 };
+            let frost = shell::sidebar_material(light, side_alpha);
             let side_frame = match app_style.sidebar {
-                SidebarStyle::Glass => egui::Frame::new().fill(theme::panel(side_alpha)).inner_margin(side_margin),
+                SidebarStyle::Glass => egui::Frame::new().fill(frost).inner_margin(side_margin),
                 SidebarStyle::Transparent => egui::Frame::new().inner_margin(side_margin),
                 SidebarStyle::Solid => egui::Frame::new().fill(look.solid()).inner_margin(side_margin),
                 SidebarStyle::Floating => egui::Frame::new()
-                    .fill(theme::panel(side_alpha.max(0.3)))
+                    .fill(frost)
                     .stroke(egui::Stroke::new(1.0, theme::glass(0.08)))
                     .corner_radius(egui::CornerRadius::same(theme::panel_radius().max(12)))
                     .outer_margin(egui::Margin { left: 10, right: 4, top: 10, bottom: 10 })
@@ -1389,15 +2079,25 @@ impl eframe::App for App {
             let q = theme::anim_bool(&ctx, "queue-drawer", self.queue_open && !self.np_open, 0.25);
             if q > 0.01 {
                 egui::Panel::right("queue").resizable(false)
-                    .exact_size(340.0 * q)
+                    .exact_size(380.0 * q)
                     .frame(egui::Frame::new().fill(theme::panel(0.42)).inner_margin(egui::Margin::symmetric(14, 16)))
                     .show_separator_line(false)
                     .show(ui, |ui| shell::queue_drawer(self, ui));
             }
+            // The words of the song being played, beside the page: opening the lyrics
+            // leaves what you were looking at where it was.
+            let l = theme::anim_bool(&ctx, "lyrics-drawer", self.lyrics_open && !self.np_open, 0.25);
+            if l > 0.01 {
+                egui::Panel::right("lyrics").resizable(false)
+                    .exact_size(380.0 * l)
+                    .frame(egui::Frame::new().fill(theme::panel(0.42)).inner_margin(egui::Margin::symmetric(14, 16)))
+                    .show_separator_line(false)
+                    .show(ui, |ui| shell::lyrics_drawer(self, ui, now));
+            }
             let main_right = ui.available_rect_before_wrap().right();
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().inner_margin(egui::Margin {
-                    left: 28,
+                    left: 34,
                     // The page's floating scrollbar rides the panel's right edge: the panel
                     // reaches the window side so the bar sits flush with it.
                     right: 0,
@@ -1427,6 +2127,7 @@ impl eframe::App for App {
             theme::set_mode(&ctx, pages);
         }
         self.draw_dialog(&ctx);
+        lyrics_share::show(&ctx, &mut self.lyrics_share);
         notes::card(self, &ctx);
         notes::dialog(self, &ctx);
         if let Some(url) = self.share_pending.take() { ctx.copy_text(url); }
@@ -1438,6 +2139,8 @@ impl eframe::App for App {
         titlebar::resize_edges(&ctx);
         // Back from the mini player.
         self.mini.fade_in(&ctx, now, shell::base_color(self));
+        // Menus carry the same blurred sleeve as the player bar, under their labels.
+        shell::frost_menus(self, &ctx);
 
         if dev_var("YTM_THEME_TOUR").is_some() {
             self.theme_tour(&ctx, now);
@@ -1477,6 +2180,33 @@ impl eframe::App for App {
             raw.events.retain(|e| !matches!(e, egui::Event::PointerMoved(_) | egui::Event::PointerGone));
             raw.events.push(egui::Event::PointerMoved(egui::pos2(x, y)));
         }
+        // Dev hook: YTM_FAKE_CLICK="secs,x,y" sends one primary click at that point, so a
+        // test run can open a menu and screenshot it.
+        if let Some((at, x, y)) = dev_var("YTM_FAKE_CLICK").and_then(|v| {
+            let mut f = v.split(',');
+            Some((f.next()?.trim().parse::<f64>().ok()?, f.next()?.trim().parse::<f32>().ok()?, f.next()?.trim().parse::<f32>().ok()?))
+        }) {
+            let state = egui::Id::unique("dev-click-state");
+            let sent = ctx.data(|d| d.get_temp::<u8>(state)).unwrap_or(0);
+            let t = raw.time.unwrap_or(0.0);
+            let click = |pressed| egui::Event::PointerButton {
+                pos: egui::pos2(x, y),
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            if t < at {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            } else if sent == 0 {
+                ctx.data_mut(|d| d.insert_temp(state, 1));
+                raw.events.push(click(true));
+                ctx.request_repaint();
+            } else if sent == 1 {
+                ctx.data_mut(|d| d.insert_temp(state, 2));
+                raw.events.push(click(false));
+                ctx.request_repaint();
+            }
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1506,7 +2236,15 @@ impl eframe::App for App {
         storage.set_string("normalize", b(self.normalize));
         storage.set_string("log_volume", b(self.log_volume));
         storage.set_string("high_quality", b(self.high_quality));
+        storage.set_string("bit_perfect", b(self.bit_perfect));
         storage.set_string("play_songs", b(self.play_songs));
+        storage.set_string("skip_ai", b(self.skip_ai));
+        storage.set_string("video_hd", b(self.video_hd));
+        storage.set_string("show_canvas", b(self.show_canvas));
+        storage.set_string("show_past_lines", b(self.show_past_lines));
+        storage.set_string("picture_order", self.picture_order.iter().map(|p| p.key()).collect::<Vec<_>>().join(","));
+        storage.set_string("video_bg", b(self.video_bg));
+        storage.set_string("lib_sort", self.lib_sort.key().to_owned());
         let folder = crate::downloads::folder();
         storage.set_string("download_dir", if folder == crate::downloads::default_folder() { String::new() } else { folder.display().to_string() });
         let (device, device_name) = self.output_device.clone().unzip();
@@ -1542,6 +2280,7 @@ impl eframe::App for App {
         }
         storage.set_string("playlist_order", self.playlist_order.join("\n"));
         storage.set_string("hidden_playlists", self.hidden_playlists.iter().cloned().collect::<Vec<_>>().join("\n"));
+        storage.set_string("fav_artists", self.fav_artists.iter().cloned().collect::<Vec<_>>().join("\n"));
         // Pretend versions (dev hook) mustn't decide the real "what's new".
         if std::env::var_os("YTM_UPDATE_AS").is_none() {
             storage.set_string("last_version", crate::update::current_version());
@@ -1558,8 +2297,14 @@ impl eframe::App for App {
             storage.set_string("font", theme::font_choice());
         }
         storage.set_string("anim_bg", b(self.anim_bg));
+        storage.set_string("page_blobs", b(self.page_blobs));
         storage.set_string("reactive_bg", b(self.reactive_bg));
+        storage.set_string("disable_blur", b(self.disable_blur));
         storage.set_string("animated_artwork", b(self.animated_artwork));
+        storage.set_string("show_best_part", b(self.show_best_part));
+        storage.set_string("show_volume", b(self.show_volume));
+        storage.set_string("sing_level", self.sing_level.to_string());
+        storage.set_string("icon_tint", b(self.icon_tint));
         storage.set_string("signature_api", self.signature_api.clone());
         storage.set_string("hires_source", self.hires_sources.join("\n"));
         storage.set_string("prefer_atmos", b(self.prefer_atmos));
@@ -1567,6 +2312,9 @@ impl eframe::App for App {
         storage.set_string("disable_direct_stream", b(self.disable_direct_stream));
         storage.set_string("sponsorblock", b(self.sponsorblock));
         storage.set_string("crossfade", b(self.crossfade));
+        storage.set_string("eq", b(self.eq_on));
+        storage.set_string("eq_gains", self.eq_gains.map(|g| g.to_string()).join(","));
+        storage.set_string("eq_no_clip", b(self.eq_no_clip));
         storage.set_string("automix", b(self.automix));
         storage.set_string("crossfade_secs", self.crossfade_secs.to_string());
         storage.set_string("show_roman", b(self.show_roman));
@@ -1590,6 +2338,13 @@ impl eframe::App for App {
         // A downloaded update installs only when the user restarted for it; nothing is
         // installed behind their back as the app closes.
         let update_ready = self.updater.as_ref().is_some_and(|u| matches!(u.state(), crate::update::State::Ready { .. }));
+        if update_ready {
+            // eframe has saved and flushed app.ron by now (its save runs before
+            // on_exit), so the backup goes into the update carrying this session's
+            // every setting — the launch-time copy could be a whole session old,
+            // and a restore from it read as "my addons are gone".
+            crate::guard_settings(&self.backend.data_dir());
+        }
         if let Some(u) = &self.updater
             && self.restart_for_update
         {
@@ -1666,6 +2421,12 @@ struct Session {
     /// The song version that was playing for the current music video: the position is its.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     playing_as: Option<Track>,
+    /// The shuffle mark as it stood, and the order its shuffle came from, so switching it
+    /// off after a restart still hands the list's own order back.
+    #[serde(default)]
+    shuffled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    order: Vec<String>,
 }
 
 /// The song version playing in place of the music video `listed`, in play `generation`.
@@ -1760,19 +2521,13 @@ fn smooth_wheel(app: &mut App, ctx: &egui::Context, raw: &mut egui::RawInput) {
     ctx.request_repaint();
 }
 
-/// Fisher-Yates with a clock-seeded xorshift; shuffling doesn't need a real RNG crate.
-pub fn shuffle<T>(v: &mut [T]) {
-    let mut x = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0x9e37_79b9_7f4a_7c15, |d| d.as_nanos() as u64)
-        | 1;
-    for i in (1..v.len()).rev() {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        v.swap(i, (x % (i as u64 + 1)) as usize);
-    }
+fn shuffled_start(len: usize) -> usize {
+    let mut indices: Vec<usize> = (0..len).collect();
+    shuffle(&mut indices);
+    indices.first().copied().unwrap_or(0)
 }
+
+pub use crate::model::shuffle;
 
 /// Whether this is the installed or the portable app (updates only apply there). It
 /// can't change while running, and the check touches the disk, so it runs once.
@@ -1788,6 +2543,47 @@ pub fn fmt_time(secs: u32) -> String {
 #[cfg(test)]
 mod session_tests {
     use super::*;
+
+    /// The video's picture: where the clip and the song have each got to decides what the player
+    /// does next. A clip is started at the song's own place, so until it runs past that
+    /// point it is still inside the download and the skip; a held song means a held
+    /// picture; and a chase that hasn't worked by the third try ends the picture rather
+    /// than blink.
+    #[test]
+    fn the_picture_holds_its_place() {
+        let at = |secs: u64| Duration::from_secs(secs);
+        let clip = Video { anchor: at(20), ..Default::default() };
+        assert_eq!(clip.step(false, true, at(0), at(20), false), Step::Start, "nothing running yet");
+        assert_eq!(clip.step(true, true, at(20), at(240), false), Step::Stay, "still catching up");
+        assert_eq!(clip.step(true, true, at(46), at(46), false), Step::Stay, "in step");
+        assert_eq!(clip.step(true, true, at(47), at(46), false), Step::Stay, "a second adrift is the picture's own pace");
+        assert_eq!(clip.step(true, true, at(60), at(46), false), Step::Again, "a clip behind its song");
+        assert_eq!(clip.step(true, false, at(60), at(46), false), Step::Stay, "paused with the song");
+        assert_eq!(clip.step(true, true, at(20), at(20), true), Step::Again, "a clip that never gave a frame is chased");
+        let tried = Video { anchors: 3, ..clip };
+        assert_eq!(tried.step(true, true, at(60), at(46), false), Step::End, "chased, and given up");
+        assert_eq!(tried.step(true, true, at(10), at(46), false), Step::Stay, "given up, still catching up");
+    }
+
+    /// The listener moving the song is told apart from the clip falling behind, so their
+    /// own seeking costs the chase nothing.
+    #[test]
+    fn a_seek_is_the_listeners_own() {
+        let at = |secs: u64| Duration::from_secs(secs);
+        let mut clip = Video::default();
+        assert!(!clip.seeked(at(1)), "a second of the song playing is not a seek");
+        assert!(clip.seeked(at(120)), "the song was moved");
+        assert!(!clip.seeked(at(121)), "and it plays on from there");
+        assert!(clip.seeked(at(30)), "back is a seek too");
+    }
+
+    /// The player says what it is doing where the quality mark stands: only while a clip
+    /// is really on its way, and never for a song YouTube Music has none of.
+    #[test]
+    fn only_a_picture_on_its_way_is_loading() {
+        assert!(Video::default().loading(), "asked, and not answered yet");
+        assert!(!Video { none: true, ..Default::default() }.loading(), "a song with no clip of its own");
+    }
 
     #[test]
     fn sessions_saved_before_song_versions_still_load() {

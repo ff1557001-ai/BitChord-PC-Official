@@ -1,6 +1,7 @@
-//! Songs saved to disk: the audio as YouTube serves it (AAC in an .m4a, at the best
-//! quality the account gets), tagged with title, artists, album and cover, in the
-//! downloads folder. A downloaded song plays from its file, so it works offline.
+//! Songs saved to disk: the best copy a hi-res source has, or the audio as YouTube
+//! serves it (AAC in an .m4a) when they don't, tagged with title, artists, album and
+//! cover when it's an .m4a, in the downloads folder. A downloaded song plays from its
+//! file, so it works offline.
 //!
 //! `downloads.json` in the data dir maps video ids to their files; a file that was
 //! moved or deleted just stops counting as downloaded.
@@ -12,7 +13,7 @@ use std::sync::{Arc, LazyLock, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::model::Track;
-use crate::stream::Shared;
+use crate::stream::{Format, Shared};
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Entry {
@@ -144,8 +145,9 @@ pub fn song_for(video_id: &str) -> Option<Track> {
 pub fn open(video_id: &str) -> Option<Arc<Shared>> {
     let entry = STATE.read().unwrap().index.get(video_id).cloned()?;
     let data = std::fs::read(&entry.path).ok()?;
+    let (_, format) = sniff(&data);
     log::info!("{video_id}: playing the downloaded file");
-    Some(Shared::from_bytes(data, entry.duration_ms, entry.loudness_db))
+    Some(Shared::from_bytes_with_format(data, entry.duration_ms, entry.loudness_db, format, None))
 }
 
 /// Write a downloaded song into the folder and remember it. Returns the file.
@@ -153,7 +155,7 @@ pub fn open(video_id: &str) -> Option<Arc<Shared>> {
 pub fn save(t: &Track, audio: &[u8], duration_ms: u64, loudness_db: Option<f32>, cover: Option<Vec<u8>>, stands_for: Option<String>) -> anyhow::Result<PathBuf> {
     let folder = folder();
     std::fs::create_dir_all(&folder)?;
-    let ext = if audio.get(4..8) == Some(b"ftyp") { "m4a" } else { "webm" };
+    let (ext, _) = sniff(audio);
     // A file already there for this song is replaced; another song's isn't.
     let mine = STATE.read().unwrap().index.get(&t.id).map(|e| e.path.clone());
     let stem = file_stem(t);
@@ -167,7 +169,7 @@ pub fn save(t: &Track, audio: &[u8], duration_ms: u64, loudness_db: Option<f32>,
     // YouTube's files say they're DASH segments ("dash" brand); as a file of its own,
     // call it audio, which some players and Explorer go by.
     let mut audio = audio.to_vec();
-    if audio.get(8..12) == Some(b"dash") {
+    if ext == "m4a" && audio.get(8..12) == Some(b"dash") {
         audio[8..12].copy_from_slice(b"M4A ");
     }
     std::fs::write(&part, &audio)?;
@@ -186,6 +188,23 @@ pub fn save(t: &Track, audio: &[u8], duration_ms: u64, loudness_db: Option<f32>,
         let _ = std::fs::write(&st.file, json);
     }
     Ok(path)
+}
+
+/// What the bytes are: the container a saved song lives in, and what the decoder needs
+/// to read it. YouTube serves AAC and, without Premium, Opus; the hi-res sources serve
+/// whatever lossless file they hold, so the file says rather than the source.
+fn sniff(audio: &[u8]) -> (&'static str, Format) {
+    let file = |ext: &'static str, hint: &'static str, mime: &str| (ext, Format::File { hint, mime: Some(mime.to_owned()) });
+    match (audio.get(4..8), audio.get(..4)) {
+        (Some(b"ftyp"), _) => ("m4a", Format::Aac),
+        (_, Some(b"fLaC")) => file("flac", "flac", "audio/flac"),
+        (_, Some(b"OggS")) => file("ogg", "ogg", "audio/ogg"),
+        (_, Some(b"RIFF")) => file("wav", "wav", "audio/wav"),
+        (_, Some(b"ID3 ")) => file("mp3", "mp3", "audio/mpeg"),
+        // An MP3 with no tag starts at its frame sync: 11 set bits.
+        _ if matches!(audio.get(..2), Some(&[0xFF, 0xE0..=0xFF])) => file("mp3", "mp3", "audio/mpeg"),
+        _ => ("webm", Format::Opus),
+    }
 }
 
 /// "Artists - Title", safe as a Windows file name.
@@ -246,9 +265,30 @@ mod tests {
             track_nr: None,
             plays: None,
             music_video: false,
+            episode: false,
         };
         let t = track("What? / Why: \"Now\"...", vec![Link { name: "AC/DC".into(), id: None }]);
         assert_eq!(file_stem(&t), "AC_DC - What_ _ Why_ _Now_");
         assert_eq!(file_stem(&track("...", Vec::new())), "abc");
+    }
+
+    #[test]
+    fn saved_files_are_named_by_what_they_hold() {
+        let head = |b: [u8; 4]| {
+            let mut v = b.to_vec();
+            v.resize(64, 0);
+            v
+        };
+        // YouTube serves AAC in an MP4 (the brand sits at offset 4) and, without Premium, Opus in a WebM.
+        let mut mp4 = head([0, 0, 0, 0x20]);
+        mp4[4..8].copy_from_slice(b"ftyp");
+        assert_eq!(sniff(&mp4).0, "m4a");
+        assert_eq!(sniff(&head([0x1A, 0x45, 0xDF, 0xA3])).0, "webm");
+        // What the addons serve is whatever file they hold.
+        assert_eq!(sniff(&head(*b"fLaC")).0, "flac");
+        assert_eq!(sniff(&head(*b"ID3 ")).0, "mp3");
+        assert_eq!(sniff(&head([0xFF, 0xFB, 0x90, 0x00])).0, "mp3");
+        assert_eq!(sniff(&head(*b"RIFF")).0, "wav");
+        assert_eq!(sniff(&head(*b"OggS")).0, "ogg");
     }
 }

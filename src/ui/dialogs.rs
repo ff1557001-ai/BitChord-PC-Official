@@ -26,6 +26,8 @@ impl App {
         let accent = self.accent_color();
         let mut done = false;
         let heading = match &dialog {
+            Dialog::GeniusAbout { .. } => "About song",
+            Dialog::AppleAlbumAbout { .. } => "About album",
             Dialog::PickPlaylist(_) => "Add to playlist",
             Dialog::NewPlaylist { .. } => "New playlist",
             Dialog::EditPlaylist { .. } => "Edit playlist",
@@ -40,6 +42,12 @@ impl App {
                 ui.label(egui::RichText::new(heading).font(theme::bold(22.0)).color(theme::text()));
                 ui.add_space(18.0);
                 match &mut dialog {
+                    Dialog::GeniusAbout { track, description } => {
+                        done = about_dialog(ui, &track.title, &track.artist_line(), description, "Genius");
+                    }
+                    Dialog::AppleAlbumAbout { title, artist, description, .. } => {
+                        done = about_dialog(ui, title, artist, description, "Apple Music");
+                    }
                     Dialog::PickPlaylist(tracks) => {
                         if dialog_row(ui, None, Some(theme::icon::LIST_PLUS), "New playlist") {
                             self.actions.push(Action::NewPlaylist(tracks.clone()));
@@ -63,7 +71,7 @@ impl App {
                         });
                     }
                     Dialog::NewPlaylist { title, tracks } => {
-                        let name = text_field(ui, "Name", title, false, "My playlist");
+                        let name = text_field(ui, "Name", title, false, false, "My playlist");
                         if ui.memory(|m| m.focused().is_none()) { name.request_focus(); }
                         ui.add_space(8.0);
                         ui.label(egui::RichText::new("Private · only you can see it").font(theme::regular(12.5)).color(theme::text_faint()));
@@ -77,9 +85,9 @@ impl App {
                         done |= cancel;
                     }
                     Dialog::EditPlaylist { id, title, description, privacy } => {
-                        text_field(ui, "Name", title, false, "Playlist name");
+                        text_field(ui, "Name", title, false, false, "Playlist name");
                         ui.add_space(16.0);
-                        text_field(ui, "Description", description, true, "Add an optional description");
+                        text_field(ui, "Description", description, true, false, "Add an optional description");
                         ui.add_space(16.0);
                         field_label(ui, "Visibility");
                         privacy_picker(ui, privacy);
@@ -176,13 +184,35 @@ impl App {
     }
 }
 
+fn about_dialog(ui: &mut Ui, title: &str, artist: &str, description: &Option<Option<String>>, source: &str) -> bool {
+    ui.label(egui::RichText::new(title).font(theme::semibold(17.0)).color(theme::text()));
+    ui.label(egui::RichText::new(artist).font(theme::regular(13.0)).color(theme::text_dim()));
+    ui.add_space(14.0);
+    match description {
+        None => { ui.spinner(); }
+        Some(Some(text)) => {
+            egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, true]).show(ui, |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(text.as_str()).font(theme::regular(14.0)).color(theme::text())).wrap());
+            });
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new(format!("Source: {source}")).font(theme::regular(12.0)).color(theme::text_faint()));
+        }
+        Some(None) => {
+            ui.label(egui::RichText::new(format!("No description available from {source}.")).font(theme::regular(14.0)).color(theme::text_dim()));
+        }
+    }
+    ui.add_space(20.0);
+    done_button(ui)
+}
+
 fn field_label(ui: &mut Ui, label: &str) {
     ui.label(egui::RichText::new(label).font(theme::semibold(13.0)).color(theme::text_dim()));
     ui.add_space(8.0);
 }
 
-/// A labelled text box on a glass fill, like the jam and transfer pages' inputs.
-pub(super) fn text_field(ui: &mut Ui, label: &str, text: &mut String, multiline: bool, hint: &str) -> egui::Response {
+/// A labelled text box on a glass fill, like the jam and transfer pages' inputs. `secret`
+/// masks what's typed, for the tokens and cookies pasted in from a browser.
+pub(super) fn text_field(ui: &mut Ui, label: &str, text: &mut String, multiline: bool, secret: bool, hint: &str) -> egui::Response {
     use egui::{Sense, vec2};
     if !label.is_empty() {
         field_label(ui, label);
@@ -194,7 +224,7 @@ pub(super) fn text_field(ui: &mut Ui, label: &str, text: &mut String, multiline:
     let edit = if multiline { egui::TextEdit::multiline(text).desired_rows(4) } else { egui::TextEdit::singleline(text).align(egui::Align2::LEFT_CENTER) };
     let resp = ui.put(
         inner,
-        edit.hint_text(egui::RichText::new(hint).color(theme::text_faint())).font(theme::regular(14.0)).frame(egui::Frame::NONE).desired_width(inner.width()),
+        edit.hint_text(egui::RichText::new(hint).color(theme::text_faint())).font(theme::regular(14.0)).frame(egui::Frame::NONE).password(secret).desired_width(inner.width()),
     );
     let focus = theme::anim_bool(ui.ctx(), resp.id.with("focus"), resp.has_focus(), 0.15);
     ui.painter().set(bg, egui::Shape::Vec(vec![

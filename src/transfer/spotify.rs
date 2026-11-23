@@ -31,7 +31,7 @@ const PAGE: usize = 343;
 const LIBRARY_PAGE: usize = 50;
 const CDN: &str = "https://open.spotifycdn.com/cdn/build/web-player/";
 /// The persisted queries this reads, found in the web player's bundle.
-const OPERATIONS: [&str; 4] = ["fetchPlaylist", "fetchLibraryTracks", "libraryV3", "profileAttributes"];
+const OPERATIONS: [&str; 6] = ["fetchPlaylist", "fetchLibraryTracks", "libraryV3", "profileAttributes", "canvas", "searchDesktop"];
 /// Where the query hashes are cached, so a new bundle (several MB) is read once per web-player release.
 const HASH_CACHE: &str = "spotify_queries.json";
 
@@ -54,6 +54,13 @@ impl Track {
     pub fn artist_line(&self) -> String {
         self.artists.join(", ")
     }
+}
+
+/// A canvas: what its file is called on Spotify's CDN, and where to fetch it.
+#[derive(Clone, Debug)]
+pub struct Canvas {
+    pub name: String,
+    pub url: String,
 }
 
 pub struct Playlist {
@@ -252,6 +259,69 @@ impl Client {
             url = page["next"].as_str().map(str::to_owned);
         }
         Ok(out)
+    }
+
+    /// Spotify's looping clip for a song heard from somewhere else: the search takes the
+    /// listener's copy of it and the `canvas` query answers with its file. `None` when
+    /// nobody uploaded a clip, or when the closest match isn't this recording — a song
+    /// six seconds off is a different take, and its clip would play over the wrong words.
+    pub async fn canvas(&self, artist: &str, title: &str, ms: u64) -> Result<Option<Canvas>> {
+        // The web player's own search, on the signed channel everything else here uses:
+        // the public Web API's search is held to a shared app quota and answers 429 for
+        // long stretches.
+        let found = match self
+            .query(
+                "searchDesktop",
+                json!({
+                    "searchTerm": format!("{title} {artist}"),
+                    "offset": 0,
+                    "limit": 1,
+                    "numberOfTopResults": 1,
+                    "includeAudiobooks": false,
+                    "includeArtistHasConcertsField": false,
+                    "includePreReleases": false,
+                    "includeLocalConcertsField": false,
+                    "includeAuthors": false,
+                }),
+            )
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                log::info!("canvas search {title}: {e:#}");
+                return Err(e);
+            }
+        };
+        let hit = &found["data"]["searchV2"]["tracksV2"]["items"][0]["item"]["data"];
+        let same = hit["duration"]["totalMilliseconds"].as_u64().is_none_or(|d| d.abs_diff(ms) <= 6000);
+        let Some(id) = hit["uri"].as_str().and_then(|u| u.rsplit(':').next()) else {
+            log::info!("canvas search {title}: no track in {}", found.to_string().chars().take(300).collect::<String>());
+            return Ok(None);
+        };
+        if !same {
+            return Ok(None);
+        }
+        let body = match self.query("canvas", json!({ "trackUri": format!("spotify:track:{id}") })).await {
+            Ok(b) => b,
+            // A bundle or an account that won't answer the query: no clip, not a failure.
+            Err(e) => {
+                log::debug!("canvas for {title}: {e}");
+                return Ok(None);
+            }
+        };
+        let canvas = &body["data"]["trackUnion"]["canvas"];
+        // A still canvas isn't worth a decoder, and a song Spotify hasn't got one of has
+        // an empty `canvas`.
+        if !canvas["type"].as_str().is_some_and(|t| t.starts_with("VIDEO")) {
+            return Ok(None);
+        }
+        let (Some(url), Some(name)) = (canvas["url"].as_str(), canvas["uri"].as_str().or(canvas["fileId"].as_str())) else {
+            return Ok(None);
+        };
+        if url.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Canvas { name: name.rsplit(':').next().unwrap_or(name).to_owned(), url: url.to_owned() }))
     }
 
     async fn library(&self) -> Result<Vec<Entry>> {
@@ -528,7 +598,8 @@ async fn query_hashes(http: &reqwest::Client, bundle: &str, data_dir: &Path) -> 
     let cache = data_dir.join(HASH_CACHE);
     if let Some(h) = std::fs::read(&cache).ok().and_then(|b| serde_json::from_slice::<Hashes>(&b).ok())
         && h.bundle == bundle
-        && h.ops.contains_key("fetchPlaylist")
+        // A cache from before an operation was added is read again for it.
+        && OPERATIONS.iter().all(|op| h.ops.contains_key(*op))
     {
         return Ok(h);
     }

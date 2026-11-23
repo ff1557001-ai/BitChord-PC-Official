@@ -130,6 +130,7 @@ pub fn track_of(i: &Item) -> Track {
         track_nr: None,
         plays: None,
         music_video: false,
+        episode: false,
     }
 }
 
@@ -995,6 +996,7 @@ mod tests {
             track_nr: Some(3),
             plays: None,
             music_video: true,
+            episode: false,
         };
         let i = item_of(&t);
         let w = serde_json::to_value(&i).unwrap();

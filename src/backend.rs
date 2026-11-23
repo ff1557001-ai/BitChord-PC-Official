@@ -22,6 +22,10 @@ pub enum Req {
     /// Home feed, optionally filtered by a mood chip's params.
     Home(Option<String>),
     HomeMore(String),
+    /// Explore's mood and genre list, for Home's mood tile.
+    Moods,
+    /// A mood played as a station: its playlists' songs, shuffled into one queue.
+    MoodStation(ytm::Mood),
     MoreQuickPicks(String),
     Explore(Vec<String>),
     Search(String),
@@ -53,17 +57,43 @@ pub enum Req {
     /// Save a song's audio to the downloads folder. `for_video`: the music video it's the
     /// song version of, which then plays it from the file (offline too).
     Download { track: Track, for_video: Option<String> },
-    Lyrics(Track),
+    Lyrics { track: Track, generation: u64, genius_enabled: bool },
+    /// The Genius description of this song, fetched on demand.
+    GeniusAbout(Track),
+    AppleAlbumAbout { id: String, title: String, artist: String },
     /// SponsorBlock's parts of a video to skip.
     Segments { video_id: String },
+    /// youtube.com's "Most replayed" curve for one video: where people drag back to.
+    BestPart(String),
+    /// Whether YouTube's own description says AI made this video: the watch page's
+    /// "Made with AI" block, which nothing in the song's own name has to repeat.
+    AiCheck { video_id: String },
     /// Romanization and translation for the lyric lines of one source.
     LyricsExtras { video_id: String, source: String, lines: Vec<String>, lang: Option<String>, target: String },
     /// Process cover art for the background; `key` is echoed back.
     Art { key: String, url: String },
+    /// Processed art for a page's own cover, which plays on nothing; `key` names the page.
+    PageArt { key: String, url: String },
     /// Apple's artist page (display name and hero clips) for the artist `id`.
     AppleArtist { id: String, name: String },
-    /// Apple's motion sleeve for a release; `key` is what the UI asked for.
-    AppleCover { key: String, album: String, artist: String, title: Option<String> },
+    /// Apple's shelves for one of its browse pages (`new`, `radio`); the path comes back.
+    AppleFeed(String),
+    /// Apple's own collection page (an album or a playlist), read from the page itself.
+    AppleCollection { url: String },
+    /// Play an Apple collection's songs: each one found on the source that has it.
+    AppleSongs { target: Target, songs: Vec<crate::apple::AppleSong> },
+    /// YouTube Music's copy of something on Apple, as the target to open it as.
+    AppleLookup(Target),
+    /// Apple's motion sleeve for a release; `key` is what the UI asked for and
+    /// `record` is Apple's own record id, which only a page opened from one of Apple's
+    /// addresses can carry.
+    AppleCover { key: String, album: String, artist: String, title: Option<String>, record: Option<String> },
+    /// The music-video player's picture: YouTube Music's music video of this song, as a stream URL
+    /// no wider than `width`. `key` is the song it was asked for, so a late answer can't
+    /// land on another one.
+    MusicVideo { key: String, track: Track, width: u32, skip: bool },
+    /// Spotify's looping canvas for a song; `key` is the song it was asked for.
+    Canvas { key: String, artist: String, title: String, ms: u64 },
     /// A handwritten signature for `name` from the service at `endpoint`; `key` is
     /// what the UI asked for.
     ArtistSignature { key: String, endpoint: String, name: String },
@@ -105,6 +135,8 @@ impl Req {
     fn name(&self) -> &'static str {
         match self {
             Req::Home(_) | Req::HomeMore(_) => "Loading home",
+            Req::Moods => "Loading moods",
+            Req::MoodStation(_) => "Mood station",
             Req::MoreQuickPicks(_) => "Loading more picks",
             Req::Explore(_) => "Loading new",
             Req::Search(_) => "Search",
@@ -122,12 +154,23 @@ impl Req {
             Req::ServerQueue => "Queue from other devices",
             Req::Upload(_) => "Upload",
             Req::Download { .. } => "Download",
-            Req::Lyrics(_) => "Lyrics",
+            Req::Lyrics { .. } => "Lyrics",
+            Req::GeniusAbout(_) => "Genius about",
+            Req::AppleAlbumAbout { .. } => "Apple album about",
             Req::Segments { .. } => "SponsorBlock",
+            Req::BestPart(_) => "Best part",
+            Req::AiCheck { .. } => "AI label",
             Req::LyricsExtras { .. } => "Translation",
             Req::Art { .. } => "Art",
+            Req::PageArt { .. } => "Page art",
             Req::AppleArtist { .. } => "Apple artist",
+            Req::AppleFeed(_) => "Apple browse page",
+            Req::AppleCollection { .. } => "Apple collection",
+            Req::AppleSongs { .. } => "Apple songs",
+            Req::AppleLookup(_) => "Apple lookup",
             Req::AppleCover { .. } => "Apple artwork",
+            Req::MusicVideo { .. } => "Music video",
+            Req::Canvas { .. } => "Spotify canvas",
             Req::ArtistSignature { .. } => "Artist signature",
             Req::CheckHiResSource { .. } => "Testing source",
             Req::Radio { .. } => "Loading radio",
@@ -151,8 +194,26 @@ impl Req {
 
     /// Background requests fail quietly (logged, no toast).
     fn quiet(&self) -> bool {
-        matches!(self, Req::Suggest { .. } | Req::Account | Req::Channels | Req::ServerQueue | Req::Art { .. } | Req::AppleArtist { .. } | Req::AppleCover { .. } | Req::ArtistSignature { .. } | Req::CheckHiResSource { .. } | Req::Prefetch { .. } | Req::HomeMore(_) | Req::Lyrics(_) | Req::Segments { .. } | Req::LyricsExtras { .. })
+        matches!(self, Req::Suggest { .. } | Req::Account | Req::Channels | Req::ServerQueue | Req::Art { .. } | Req::PageArt { .. } | Req::AppleArtist { .. } | Req::AppleFeed(_) | Req::AppleCollection { .. } | Req::AppleCover { .. } | Req::MusicVideo { .. } | Req::ArtistSignature { .. } | Req::CheckHiResSource { .. } | Req::Prefetch { .. } | Req::HomeMore(_) | Req::Moods | Req::Lyrics { .. } | Req::GeniusAbout(_) | Req::AppleAlbumAbout { .. } | Req::Segments { .. } | Req::AiCheck { .. } | Req::BestPart(_) | Req::LyricsExtras { .. })
     }
+}
+
+/// Whether Google and Apple mean the same thing by these two names.
+fn same_name(a: &str, b: &str) -> bool {
+    let (a, b) = (crate::apple::norm(a), crate::apple::norm(b));
+    !a.is_empty() && !b.is_empty() && (a == b || a.contains(&b) || b.contains(&a))
+}
+
+/// Whether either of these artist lines names one of the other's.
+fn near_artist(a: &str, b: &str) -> bool {
+    let (x, y) = (crate::apple::norm(a), crate::apple::norm(b));
+    if x.is_empty() || y.is_empty() {
+        return false;
+    }
+    x.contains(&y) || y.contains(&x) || a.split(',').any(|p| {
+        let p = crate::apple::norm(p);
+        p.len() > 2 && y.contains(&p)
+    })
 }
 
 pub struct Explore {
@@ -237,7 +298,6 @@ pub struct ArtistPage {
     pub id: String,
     pub name: String,
     pub banner: Vec<Thumb>,
-    pub subscribers: Option<u64>,
     pub description: Option<String>,
     pub top: Vec<Track>,
     /// "Top songs" playlist behind the shelf's Show all button.
@@ -266,7 +326,7 @@ pub struct Channels {
 
 pub enum Resp {
     Home(ytm::HomePage),
-    HomeMore(ytm::HomePage),
+    HomeMore { token: String, page: ytm::HomePage },
     QuickPicksMore { seed: String, tracks: Vec<Track> },
     Explore(Explore),
     Search(SearchResults),
@@ -287,22 +347,47 @@ pub enum Resp {
     /// Upload finished: how many files went up, and which failed.
     Uploaded { done: usize, failed: Vec<String> },
     Downloaded { title: String, path: PathBuf },
-    /// Every source's lyrics for a song (empty when nobody has them).
-    Lyrics { video_id: String, lyrics: LyricsSet },
+    /// A preliminary or final set for this request (only a final set may be empty).
+    Lyrics { video_id: String, generation: u64, lyrics: LyricsSet, complete: bool },
+    /// `None` means no matching Genius description or a lookup failure.
+    GeniusAbout { video_id: String, description: Option<String> },
+    AppleAlbumAbout { id: String, description: Option<String> },
     Segments { video_id: String, segments: Vec<crate::sponsorblock::Segment> },
+    /// The curve, or `None` when youtube.com charts no replays for this video.
+    BestPart { video_id: String, heat: Option<crate::bestpart::Heatmap> },
+    /// YouTube's own word on whether AI made the video, from its description.
+    AiLabel { video_id: String, ai: bool },
     /// Romanization/translation for one source's lines, arriving after them.
     LyricsExtras { video_id: String, source: String, target: String, extras: crate::translate::Extras },
     Art { key: String, art: Art },
+    /// The same for a page's own cover, which nothing is playing.
+    PageArt { key: String, art: Art },
     /// Apple's page for an artist, when there is one (`None`: no match, or no token).
     AppleArtist { id: String, info: Option<crate::apple::Artwork> },
+    /// Apple's shelves for one of its browse pages; `path` is what the UI asked for
+    /// (empty `shelves`: the page didn't answer).
+    AppleFeed { path: String, shelves: Vec<crate::apple::Shelf> },
+    /// Apple's own collection page (`None`: the page didn't answer).
+    AppleCollection { url: String, collection: Option<crate::apple::Collection> },
+    /// YouTube Music's copy of an Apple tile, as the target to open it as (`None`: none).
+    AppleOpened { apple: Target, resolved: Option<Target> },
     /// Apple's motion sleeve for a release; `key` is what the UI asked it for.
     AppleCover { key: String, motion: Option<crate::apple::Motion> },
+    /// The music-video player's picture for `key`'s song: `None` when YouTube Music has no clip of
+    /// it, or the clip has no stream the decoder can take.
+    MusicVideo { key: String, video: Option<innertube::Video> },
+    /// Spotify's canvas for `key`'s song: its file's name and address, when there is one.
+    Canvas { key: String, canvas: Option<(String, String)> },
     /// A signature for an artist, already whitened for the header.
     ArtistSignature { key: String, signature: Option<crate::artist_signature::Signature> },
     /// What a pasted hi-res source link really serves; `key` is what the UI asked with.
     /// Neither the summary nor the reason names the link, which carries a token.
     HiResSourceChecked { key: String, result: Result<String, String> },
     Radio { seed: String, tracks: Vec<Track> },
+    /// Explore's moods, for Home's mood tile.
+    Moods(Vec<ytm::Mood>),
+    /// A mood's station: its name, and the queue its playlists make.
+    MoodStation { name: String, tracks: Vec<Track> },
     /// What was asked to play (a `Req::PlayCollection`), and its songs.
     PlayQueue { target: Target, tracks: Vec<Track> },
     Liked { video_id: String, like: bool },
@@ -336,7 +421,9 @@ impl Resp {
         matches!(
             self,
             Resp::Home(_)
-                | Resp::HomeMore(_)
+                | Resp::HomeMore { .. }
+                | Resp::Moods(_)
+                | Resp::MoodStation { .. }
                 | Resp::QuickPicksMore { .. }
                 | Resp::Suggest { .. }
                 | Resp::Library(_)
@@ -355,6 +442,23 @@ impl Resp {
     /// so the page stops waiting for it.
     fn ended(id: String, load: u64) -> Self {
         Resp::CollectionMore { id, load, tracks: Vec::new(), set_ids: Vec::new(), more: false }
+    }
+}
+
+/// Dev hook: hide the named sources from both preliminary and final responses.
+fn prepare_lyrics_response(mut set: LyricsSet, fail: Option<&str>, final_set: bool) -> Option<LyricsSet> {
+    if let Some(fail) = fail {
+        set.sources.retain(|l| !fail.split(',').any(|k| k.trim() == l.provider.key()));
+    }
+    (final_set || !set.sources.is_empty()).then_some(set)
+}
+
+/// Complete an about request even if its handler panicked or was cancelled.
+fn finish_genius_about(video_id: Option<String>, resp: Option<Resp>) -> Option<Resp> {
+    match (video_id, resp) {
+        (Some(_), answer @ Some(Resp::GeniusAbout { .. })) => answer,
+        (Some(video_id), _) => Some(Resp::GeniusAbout { video_id, description: None }),
+        (None, answer) => answer,
     }
 }
 
@@ -475,6 +579,11 @@ const PREFETCH_SONG_WAIT: std::time::Duration = std::time::Duration::from_secs(2
 /// addon mints a lossless URL in a few seconds, and every source is asked at once.
 const HIRES_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long a song's best part is waited for. It marks a button on the artwork, not the
+/// music: an answer that misses the window leaves the song without one until it's asked
+/// again, and that costs nothing.
+const HEATMAP_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
 #[derive(Clone)]
 pub struct Backend {
     rt: Arc<Runtime>,
@@ -509,6 +618,10 @@ pub struct Backend {
     /// video and whether the account has Premium (which gets YouTube's own pairs). One
     /// cell each, so a prefetch and the play of the same video share a lookup.
     songs: Arc<std::sync::Mutex<std::collections::HashMap<String, SongCell>>>,
+    /// The music video found for a song this session, by song id. A search that goes
+    /// quiet later — throttled, or answered as a bot — mustn't take the picture away from
+    /// a song that had one found for it before.
+    videos: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl Backend {
@@ -535,7 +648,7 @@ impl Backend {
         {
             log::warn!("proxy relay: {e:#}");
         }
-        let backend = Self { rt: Arc::new(rt), api, tx, audio, wake, prefetched: Default::default(), current: Default::default(), data_dir, lyrics, translate, jsc, premium: Arc::new(tokio::sync::Mutex::new(Err(None))), hq: Default::default(), hires: Default::default(), atmos: Default::default(), disable_direct: Default::default(), reverted: Default::default(), songs: Default::default() };
+        let backend = Self { rt: Arc::new(rt), api, tx, audio, wake, prefetched: Default::default(), current: Default::default(), data_dir, lyrics, translate, jsc, premium: Arc::new(tokio::sync::Mutex::new(Err(None))), hq: Default::default(), hires: Default::default(), atmos: Default::default(), disable_direct: Default::default(), reverted: Default::default(), songs: Default::default(), videos: Default::default() };
         backend.keep_signed_in();
         Ok(backend)
     }
@@ -636,6 +749,10 @@ impl Backend {
         self.rt.spawn(f);
     }
 
+    pub fn spawn_handle<F: Future<Output = ()> + Send + 'static>(&self, f: F) -> tokio::task::JoinHandle<()> {
+        self.rt.spawn(f)
+    }
+
     pub fn wake(&self) {
         (self.wake)()
     }
@@ -650,11 +767,23 @@ impl Backend {
             Req::Album { id, load } | Req::Playlist { id, load, .. } => Some((id.clone(), *load)),
             _ => None,
         };
+        let about_id = match &req {
+            Req::GeniusAbout(track) => Some(track.id.clone()),
+            _ => None,
+        };
+        let album_about_id = match &req {
+            Req::AppleAlbumAbout { id, .. } => Some(id.clone()),
+            _ => None,
+        };
+        let lyrics_ticket = match &req {
+            Req::Lyrics { track, generation, .. } => Some(self.lyrics.begin_fetch(&track.id, *generation)),
+            _ => None,
+        };
         let this = self.clone();
         let t0 = std::time::Instant::now();
         let epoch = self.api.epoch();
         let task = self.rt.spawn(async move {
-            let r = this.handle(req).await;
+            let r = this.handle(req, lyrics_ticket).await;
             log::debug!("{what}: done in {:?}", t0.elapsed());
             r
         });
@@ -673,6 +802,12 @@ impl Backend {
                 }
                 Err(_) => None,
             };
+            let mut resp = finish_genius_about(about_id, resp);
+            if let Some(id) = album_about_id
+                && !matches!(resp, Some(Resp::AppleAlbumAbout { .. }))
+            {
+                resp = Some(Resp::AppleAlbumAbout { id, description: None });
+            }
             // An album or playlist load that failed ends too, so its page stops waiting.
             if let Some((id, load)) = collection
                 && !matches!(resp, Some(Resp::Collection { .. } | Resp::CollectionMore { .. }))
@@ -697,7 +832,14 @@ impl Backend {
         });
     }
 
-    async fn handle(&self, req: Req) -> Option<Resp> {
+    /// A sleeve as a 64 px blur: fetched near that size, never the 544 px art.
+    async fn blur(&self, url: String) -> anyhow::Result<Art> {
+        let url = model::sized(&url, 2 * crate::art::SIZE);
+        let bytes = self.http().get(&url).send().await?.error_for_status()?.bytes().await?;
+        Ok(tokio::task::spawn_blocking(move || crate::art::process(&bytes)).await??)
+    }
+
+    async fn handle(&self, req: Req, lyrics_ticket: Option<lyrics::FetchTicket>) -> Option<Resp> {
         let api = &*self.api;
         // Personalised pages ask as the account when signed in, like music.youtube.com.
         let me = self.is_logged_in();
@@ -705,7 +847,15 @@ impl Backend {
         let res: anyhow::Result<Option<Resp>> = async {
             Ok(Some(match req {
                 Req::Home(params) => Resp::Home(ytm::home(api, params.as_deref(), me).await?),
-                Req::HomeMore(token) => Resp::HomeMore(ytm::home_more(api, &token, me).await?),
+                Req::HomeMore(token) => {
+                    let page = ytm::home_more(api, &token, me).await?;
+                    Resp::HomeMore { token, page }
+                }
+                Req::Moods => Resp::Moods(ytm::moods(api, me).await?),
+                Req::MoodStation(mood) => {
+                    let tracks = ytm::mood_station(api, &mood, me).await?;
+                    Resp::MoodStation { name: mood.name, tracks }
+                }
                 Req::MoreQuickPicks(seed) => {
                     let tracks = ytm::radio(api, &seed, me, 0).await?;
                     Resp::QuickPicksMore { seed, tracks }
@@ -748,26 +898,50 @@ impl Backend {
                     None => return Ok(None),
                 },
                 Req::Upload(files) => self.upload(&files).await?,
-                Req::Lyrics(track) => {
+                Req::Lyrics { track, generation, genius_enabled } => {
                     let video_id = track.id.clone();
-                    Resp::Lyrics { lyrics: self.lyrics_for(&track).await, video_id }
+                    let ticket = lyrics_ticket.as_ref().expect("lyrics request registered");
+                    Resp::Lyrics { lyrics: self.lyrics_for(&track, generation, ticket, genius_enabled).await, video_id, generation, complete: true }
+                }
+                Req::GeniusAbout(track) => {
+                    let artist = track.artist_line();
+                    let query = lyrics::Query {
+                        video_id: &track.id,
+                        song: &track.title,
+                        artist: &artist,
+                        album: track.album.as_ref().map(|a| a.name.as_str()),
+                        duration: track.duration,
+                    };
+                    let description = self.lyrics.genius_about(&query).await.unwrap_or_else(|e| {
+                        log::info!("genius about: {e:#}");
+                        None
+                    });
+                    Resp::GeniusAbout { video_id: track.id, description }
+                }
+                Req::AppleAlbumAbout { id, title, artist } => {
+                    let description = crate::apple::album_description(&self.http(), &title, &artist).await;
+                    Resp::AppleAlbumAbout { id, description }
                 }
                 Req::Segments { video_id } => {
                     let segments = crate::sponsorblock::segments(&self.http(), &video_id).await?;
                     Resp::Segments { video_id, segments }
+                }
+                Req::BestPart(video_id) => {
+                    let heat = self.replay_curve(&video_id).await;
+                    Resp::BestPart { video_id, heat }
+                }
+                Req::AiCheck { video_id } => {
+                    let vd = self.api.visitor_data(false).await?;
+                    let ai = crate::innertube::made_with_ai(&self.http(), &video_id, &vd).await?;
+                    Resp::AiLabel { video_id, ai }
                 }
                 Req::LyricsExtras { video_id, source, lines, lang, target } => {
                     let key = format!("{video_id}_{source}");
                     let Some(extras) = self.translate.extras(&key, &lines, lang.as_deref(), &target).await else { return Ok(None) };
                     Resp::LyricsExtras { video_id, source, target, extras }
                 }
-                Req::Art { key, url } => {
-                    // The backdrop is a 64 px blur; fetch near that, not the 544 px art.
-                    let url = model::sized(&url, 2 * crate::art::SIZE);
-                    let bytes = self.http().get(&url).send().await?.error_for_status()?.bytes().await?;
-                    let art = tokio::task::spawn_blocking(move || crate::art::process(&bytes)).await??;
-                    Resp::Art { key, art }
-                }
+                Req::Art { key, url } => Resp::Art { key, art: self.blur(url).await? },
+                Req::PageArt { key, url } => Resp::PageArt { key, art: self.blur(url).await? },
                 Req::AppleArtist { id, name } => {
                     let info = crate::apple::artist(&self.http(), &name).await;
                     log::info!("apple artist '{name}': {}", match &info {
@@ -779,15 +953,70 @@ impl Backend {
                     });
                     Resp::AppleArtist { id, info }
                 }
-                Req::AppleCover { key, album, artist, title } => {
-                    let motion = match title.as_deref() {
-                        Some(t) => crate::apple::song_motion(&self.http(), t, &artist, Some(&album)).await,
-                        None => crate::apple::album_motion(&self.http(), &album, &artist).await,
+                Req::AppleFeed(path) => {
+                    let shelves = crate::apple::shelves(&self.http(), &path).await.unwrap_or_default();
+                    log::debug!("apple '{}': {} shelves", path, shelves.len());
+                    Resp::AppleFeed { path, shelves }
+                }
+                Req::AppleCollection { url } => {
+                    let collection = crate::apple::collection(&self.http(), &url).await.ok();
+                    match &collection {
+                        Some(c) => log::debug!("apple collection '{}': {} songs", c.title, c.songs.len()),
+                        None => log::debug!("apple collection: no answer for the page"),
+                    }
+                    Resp::AppleCollection { url, collection }
+                }
+                Req::AppleSongs { target, songs } => {
+                    // Every song is looked for on its own: a name Apple gives may belong
+                    // to a copy YouTube Music doesn't have, and the rest still play.
+                    let mut tracks = Vec::with_capacity(songs.len());
+                    for s in &songs {
+                        match self.find_song(&s.title, &s.artist, me).await {
+                            Ok(t) => tracks.push(t),
+                            Err(e) => log::debug!("apple song '{}': {e:#}", s.title),
+                        }
+                    }
+                    Resp::PlayQueue { target, tracks }
+                }
+                Req::AppleLookup(apple) => {
+                    let name = match &apple {
+                        Target::Apple { title, artist, .. } => format!("{title} ({artist})"),
+                        t => format!("{t:?}"),
+                    };
+                    let resolved = match self.apple_target(&apple, me).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::debug!("apple lookup '{name}': {e:#}");
+                            None
+                        }
+                    };
+                    Resp::AppleOpened { apple, resolved }
+                }
+                Req::AppleCover { key, album, artist, title, record } => {
+                    let motion = match (record.as_deref(), title.as_deref()) {
+                        (Some(id), _) => crate::apple::motion_by_id(&self.http(), id).await,
+                        (None, Some(t)) => crate::apple::song_motion(&self.http(), t, &artist, Some(&album)).await,
+                        (None, None) => crate::apple::album_motion(&self.http(), &album, &artist).await,
                     };
                     if motion.is_none() {
                         log::debug!("apple: no motion sleeve for '{album}' by '{artist}'");
                     }
                     Resp::AppleCover { key, motion }
+                }
+                Req::MusicVideo { key, track, width, skip } => {
+                    // A picture YouTube Music could have but didn't answer for is asked
+                    // for again shortly: a search that comes back empty because the
+                    // listener's other traffic has it throttled is not the song having no
+                    // video, and the second try usually finds what the first lost.
+                    let mut video = self.music_video(&track, width, me, skip).await.map_err(|e| {
+                        log::info!("music video for '{}': {e:#}", track.title);
+                        e
+                    }).ok();
+                    if video.is_none() {
+                        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                        video = self.music_video(&track, width, me, skip).await.ok();
+                    }
+                    Resp::MusicVideo { key, video }
                 }
                 Req::ArtistSignature { key, endpoint, name } => {
                     let signature = crate::artist_signature::lookup(&self.http(), &endpoint, &name).await;
@@ -806,8 +1035,13 @@ impl Backend {
                     }
                     Resp::HiResSourceChecked { key, result: result.map_err(|e| e.to_string()) }
                 }
-                Req::Radio { seed, song_of } => {
-                    // A music video's radio is music videos; its song's is songs, as from the
+                Req::Canvas { key, artist, title, ms } => {
+                    // A song Spotify has no clip of, or an app never signed in to Spotify:
+                    // no canvas, and the sleeve keeps its art.
+                    let canvas = crate::transfer::canvas(&artist, &title, ms).await.map(|c| (c.name, c.url));
+                    Resp::Canvas { key, canvas }
+                }
+                Req::Radio { seed, song_of } => {                    // A music video's radio is music videos; its song's is songs, as from the
                     // song itself. The lookup is shared with its play's (one per video).
                     let song = self.song_version(&seed, song_of.as_ref(), PREFETCH_SONG_WAIT).await;
                     let from = song.as_ref().map_or(&seed, |s| &s.id);
@@ -822,6 +1056,7 @@ impl Backend {
                         Target::Playlist(id) => ytm::playlist(api, id, me, None).await?.tracks,
                         Target::Artist(id) => ytm::artist(api, id).await?.top,
                         Target::Song(t) => vec![t.clone()],
+                        Target::Apple { kind, title, artist, .. } => self.apple_tracks(*kind, title, artist, me).await?,
                     };
                     Resp::PlayQueue { target, tracks }
                 }
@@ -904,10 +1139,31 @@ impl Backend {
         let api = &*self.api;
         let (charts, new) = tokio::join!(ytm::charts(api), ytm::new_albums(api, me));
         let charts = charts?;
+        // The charts page answers with its videos, genres and artists but stopped carrying
+        // its ranked songs shelf, so the hot list is read out of the chart playlist it still
+        // names as trending. A page that names none, or a playlist that will not open,
+        // leaves the row out rather than filling it with a guess.
+        let mut top = charts.top;
+        let trending = charts.playlists.iter().find_map(|c| {
+            let hot = {
+                let t = c.title.to_lowercase();
+                t.contains("trending") || t.contains("top songs")
+            };
+            match (&c.target, hot) {
+                (Target::Playlist(id), true) => Some(id.clone()),
+                _ => None,
+            }
+        });
+        if top.is_empty()
+            && let Some(id) = trending
+            && let Ok(pl) = ytm::playlist(api, &id, false, Some(20)).await
+        {
+            top = pl.tracks;
+        }
         Ok(Resp::Explore(Explore {
             new_albums: popular_new_albums(&new.unwrap_or_default(), &charts.artists, preferred_artists),
             charts: charts.playlists,
-            top: charts.top,
+            top,
         }))
     }
 
@@ -934,6 +1190,163 @@ impl Backend {
             playlists: pl.unwrap_or_default(),
             query,
         }))
+    }
+
+    /// YouTube Music's copy of a video Apple has: the clip is Apple's, the sound has to
+    /// come from Google. Apple's own title breaks the tie between the video hits, since
+    /// YouTube's order is the only ranking worth trusting over it. `mine` accepts nothing
+    /// but the artist's own clip — someone else's cover or a fan channel's lyric video is
+    /// no picture for the song, and counts as missing rather than as a hit.
+    async fn find_video(&self, artist: &str, title: &str, me: bool, mine: bool) -> anyhow::Result<Track> {
+        let query = format!("{title} {artist}");
+        let hits = ytm::search_tracks(&*self.api, &query, ytm::Filter::Videos, me).await?;
+        let want = title.to_lowercase();
+        let ours = |t: &Track| !mine || near_artist(artist, &t.artist_line());
+        let named = hits.iter().find(|t| t.music_video && ours(t) && t.title.to_lowercase().contains(&want)).cloned();
+        let official = hits.iter().find(|t| t.music_video && ours(t)).cloned();
+        let found = named.or(official).or_else(|| hits.into_iter().find(|t| ours(t)));
+        found.ok_or_else(|| anyhow::anyhow!("YouTube Music has no copy of {title}"))
+    }
+
+    /// The clip YouTube Music holds for a song that is not itself a video: the video
+    /// version paired with the song on its own page first, then a search of the song and
+    /// its artist, then one naming the official video — YouTube Music's own copy before
+    /// anything else is trusted with the picture.
+    async fn video_for(&self, track: &Track, me: bool) -> anyhow::Result<Track> {
+        // Only the song's own artist's clip — but leniently: a video that names none of
+        // the song's artists is someone else's, while one that names any of them is the
+        // song's own (features, remixers and all).
+        let wanted: Vec<String> = track.artists.iter().map(|a| crate::apple::norm(&a.name)).filter(|n| !n.is_empty()).collect();
+        let ours = |t: &Track| {
+            let has: Vec<String> = t.artists.iter().map(|a| crate::apple::norm(&a.name)).collect();
+            has.is_empty() || wanted.iter().any(|w| has.iter().any(|h| h == w || h.contains(w.as_str()) || w.contains(h.as_str())))
+        };
+        if let Ok(Some(paired)) = ytm::paired_video(&self.api, &track.id).await
+            && ours(&paired)
+        {
+            return Ok(paired);
+        }
+        match self.find_video(&track.artist_line(), &track.title, me, true).await {
+            Ok(t) => Ok(t),
+            Err(e) => {
+                log::info!("music video for '{}': {e:#}; asking for the official video", track.title);
+                let query = format!("{} official music video", track.title);
+                let hits = ytm::search_tracks(&*self.api, &query, ytm::Filter::Videos, me).await?;
+                let want = track.title.to_lowercase();
+                hits.into_iter()
+                    .find(|t| t.music_video && t.title.to_lowercase().contains(&want) && ours(t))
+                    .ok_or_else(|| anyhow::anyhow!("YouTube Music has no music video of {}", track.title))
+            }
+        }
+    }
+
+    /// The music-video player's picture for a song: the music video YouTube Music has of it — the
+    /// song's own id when it already is one, its paired video version next, and only ever
+    /// the same artist's clip — and the video-only stream to decode from it, which carries
+    /// no sound, so the song keeps playing underneath. With `skip`, the parts the
+    /// SponsorBlock community marked as not the music come back with it, so the clip can
+    /// be started where the song actually begins inside it.
+    async fn music_video(&self, track: &Track, width: u32, me: bool, skip: bool) -> anyhow::Result<innertube::Video> {
+        let id = self.video_id(track, me).await?;
+        let vd = self.api.visitor_data(false).await?;
+        let mut v = match innertube::video_stream(&self.http(), &id, &vd, width).await {
+            Ok(v) => v,
+            // A clip the anonymous client is refused is one the listener's own session
+            // may well be allowed: YouTube Music already knows them.
+            Err(e) if needs_account(&e) => {
+                log::info!("video {id}: the anonymous client is refused ({e:#}); asking as the account");
+                innertube::video_stream_signed(&self.api, &id, width).await?
+            }
+            Err(e) => {
+                log::info!("visionOS picture: {e:#}; retrying with new visitor data");
+                let vd = self.api.visitor_data(true).await?;
+                innertube::video_stream(&self.http(), &id, &vd, width).await?
+            }
+        };
+        // A song's video usually runs ahead of the song itself — a title card, an
+        // interview, a skit. The marks say how far, and the picture starts from there
+        // rather than from the clip's top.
+        if skip {
+            match crate::sponsorblock::segments(&self.http(), &v.id).await {
+                Ok(segs) => {
+                    v.skip = segs.into_iter().filter(|s| s.fits(v.duration_s)).collect();
+                    if !v.skip.is_empty() {
+                        log::info!("sponsorblock: {} mark(s) on the clip {}", v.skip.len(), v.id);
+                    }
+                }
+                Err(e) => log::debug!("sponsorblock marks for the clip {id}: {e:#}"),
+            }
+        }
+        Ok(v)
+    }
+
+    /// The video YouTube Music holds for a song — and the one it held the last time the
+    /// song was asked about. A lookup that fails now mustn't leave a song whose clip was
+    /// already found without a picture.
+    async fn video_id(&self, track: &Track, me: bool) -> anyhow::Result<String> {
+        if track.music_video {
+            return Ok(track.id.clone());
+        }
+        let known = self.videos.lock().unwrap().get(&track.id).cloned();
+        if let Some(id) = known {
+            return Ok(id);
+        }
+        let id = self.video_for(track, me).await?.id;
+        self.videos.lock().unwrap().insert(track.id.clone(), id.clone());
+        Ok(id)
+    }
+
+    /// What plays when an Apple tile is asked for as a queue: the songs YouTube Music
+    /// has of the release Apple names.
+    async fn apple_tracks(&self, kind: model::AppleKind, title: &str, artist: &str, me: bool) -> anyhow::Result<Vec<Track>> {
+        use model::AppleKind as K;
+        Ok(match kind {
+            K::Video => vec![self.find_video(artist, title, me, false).await?],
+            K::Song => vec![self.find_song(title, artist, me).await?],
+            K::Album => ytm::album(&*self.api, &self.find_release(title, artist, false, me).await?).await?.tracks,
+            K::Playlist => ytm::playlist(&*self.api, &self.find_release(title, artist, true, me).await?, me, None).await?.tracks,
+            // Apple's live radio is Apple's own stream; Google has nothing like it.
+            K::Radio => return Err(anyhow::anyhow!("Apple's live radio doesn't play here — it's Apple's own stream")),
+        })
+    }
+
+    /// YouTube Music's copy of an Apple tile, as the target to open it as. Apple's ids
+    /// mean nothing to Google, so its name and artist do the looking up.
+    async fn apple_target(&self, target: &Target, me: bool) -> anyhow::Result<Option<Target>> {
+        let Target::Apple { kind, title, artist, .. } = target else { return Ok(None) };
+        use model::AppleKind as K;
+        let found = match kind {
+            K::Album => Some(Target::Album(self.find_release(title, artist, false, me).await?)),
+            K::Playlist => Some(Target::Playlist(self.find_release(title, artist, true, me).await?)),
+            K::Song => Some(Target::Song(self.find_song(title, artist, me).await?)),
+            K::Video => Some(Target::Song(self.find_video(artist, title, me, false).await?)),
+            K::Radio => None,
+        };
+        Ok(found)
+    }
+
+    /// YouTube Music's copy of a song Apple names, in Google's own order: the hit with
+    /// both Apple's title and its artist, else its title, else whatever it ranks first.
+    async fn find_song(&self, title: &str, artist: &str, me: bool) -> anyhow::Result<Track> {
+        let hits = ytm::search_tracks(&*self.api, &format!("{title} {artist}"), ytm::Filter::Songs, me).await?;
+        let named = hits.iter().find(|t| same_name(&t.title, title) && near_artist(artist, &t.artist_line())).cloned();
+        let titled = named.or_else(|| hits.iter().find(|t| same_name(&t.title, title)).cloned());
+        titled.or_else(|| hits.first().cloned()).ok_or_else(|| anyhow::anyhow!("YouTube Music has no copy of {title}"))
+    }
+
+    /// YouTube Music's id for a release Apple names. Apple's playlists are curated under
+    /// Apple's own name, so only their titles are worth searching for.
+    async fn find_release(&self, title: &str, artist: &str, playlist: bool, me: bool) -> anyhow::Result<String> {
+        let filter = if playlist { ytm::Filter::Playlists } else { ytm::Filter::Albums };
+        let query = if playlist || artist.trim().is_empty() { title.to_owned() } else { format!("{title} {artist}") };
+        let hits = ytm::search_cards(&*self.api, &query, filter, me).await?;
+        let pick = |card: &Card| match &card.target {
+            Target::Album(id) | Target::Playlist(id) => Some(id.clone()),
+            _ => None,
+        };
+        let named = hits.iter().find(|c| same_name(&c.title, title) && (playlist || near_artist(artist, &c.subtitle))).and_then(pick);
+        let titled = named.or_else(|| hits.iter().find(|c| same_name(&c.title, title)).and_then(pick));
+        titled.or_else(|| hits.first().and_then(pick)).ok_or_else(|| anyhow::anyhow!("YouTube Music has no copy of {title}"))
     }
 
     /// Saved playlists and albums.
@@ -1019,7 +1432,7 @@ impl Backend {
         Ok(())
     }
 
-    async fn lyrics_for(&self, t: &Track) -> LyricsSet {
+    async fn lyrics_for(&self, t: &Track, generation: u64, ticket: &lyrics::FetchTicket, genius_enabled: bool) -> LyricsSet {
         let artist = t.artist_line();
         let query = lyrics::Query {
             video_id: &t.id,
@@ -1031,15 +1444,17 @@ impl Backend {
                 None => self.stream_duration(&t.id).await,
             },
         };
-        let mut set = self.lyrics.fetch(&query).await.unwrap_or_else(|e| {
+        let fail = std::env::var("YTM_LYRICS_FAIL").ok();
+        let set = self.lyrics.fetch(&query, ticket, genius_enabled, |partial| {
+            if let Some(partial) = prepare_lyrics_response(partial, fail.as_deref(), false) {
+                let _ = self.tx.send(Resp::Lyrics { video_id: t.id.clone(), generation, lyrics: partial, complete: false });
+                self.wake();
+            }
+        }).await.unwrap_or_else(|e| {
             log::warn!("lyrics failed: {e:#}");
             LyricsSet::default()
         });
-        // Dev hook: YTM_LYRICS_FAIL=<source key>[,<key>…] makes those sources come back empty.
-        if let Ok(fail) = std::env::var("YTM_LYRICS_FAIL") {
-            set.sources.retain(|l| !fail.split(',').any(|k| k.trim() == l.provider.key()));
-        }
-        set
+        prepare_lyrics_response(set, fail.as_deref(), true).expect("final lyrics response")
     }
 
     /// The song's length from its stream, for a track listed without one (some home,
@@ -1392,12 +1807,20 @@ impl Backend {
         })
     }
 
-    /// Download a song into the downloads folder, at the best quality the account gets.
+    /// Download a song into the downloads folder. The listener's sources answer first, so
+    /// a saved song is the lossless copy they have; YouTube's best is the fallback. An
+    /// Atmos copy is decoded in memory and has no container to write, so it falls back too.
     async fn download(&self, t: &Track, for_video: Option<String>) -> anyhow::Result<PathBuf> {
-        let (source, s) = self.resolve(&t.id, true, Some(t), false, false).await?;
+        let (source, s) = self.resolve(&t.id, true, Some(t), true, false).await?;
+        let (source, s) = if matches!(s.format, stream::Format::Pcm { .. }) {
+            log::info!("download {}: the source's Atmos copy isn't a file, taking YouTube's", t.id);
+            self.resolve(&t.id, true, Some(t), false, false).await?
+        } else {
+            (source, s)
+        };
         log::info!("download {}: {} bytes from {source:?}", t.id, s.size);
         let shared = Shared::new(s.size, s.duration_ms, s.loudness_db, s.format.clone(), s.info, false);
-        stream::download(self.http(), s.url, s.user_agent, shared.clone(), Some(self.refresher(source, &t.id, s.format, None)), s.ranging).await;
+        stream::download(self.http(), s.url, s.user_agent, shared.clone(), Some(self.refresher(source, &t.id, s.format, Some(t.clone()))), s.ranging).await;
         if let Some(e) = shared.error() {
             anyhow::bail!("{e}");
         }
@@ -1413,8 +1836,8 @@ impl Backend {
     /// Find a stream URL, trying the fastest source that can play the song. `best`
     /// (downloads) takes the high quality stream whatever the setting, and waits for
     /// the solver it needs. Playback without Premium takes Opus where there is one;
-    /// downloads stay AAC, which saves as a tagged .m4a. `allow_hires`: try the listener's
-    /// addon source first (playback only). `prefetch`: only somewhere to start is needed,
+    /// downloads take AAC, which saves as a tagged .m4a. `allow_hires`: try the listener's
+    /// addon sources first (playback and downloads). `prefetch`: only somewhere to start is needed,
     /// so a source that would have to be fetched and decoded whole is left for the play.
     async fn resolve(&self, video_id: &str, best: bool, track: Option<&Track>, allow_hires: bool, prefetch: bool) -> anyhow::Result<(Source, ResolvedStream)> {
         // The listener's addons answer for the songs they have; when they miss, YouTube plays.
@@ -1466,19 +1889,25 @@ impl Backend {
         let opus = if best { stream::Format::Aac } else { stream::Format::Opus };
         match self.resolve_from(Source::VisionOs, video_id, opus, None).await {
             Ok(s) => Ok((Source::VisionOs, s)),
-            // Age-restricted or Premium-only: only signed-in web players get it.
-            Err(e) if needs_account(&e) => {
-                log::info!("{video_id} needs a signed-in player ({e:#})");
-                let session = self.api.account().ok_or_else(|| anyhow::anyhow!("sign in to play this song"))?;
-                if self.is_premium(&session).await {
-                    match self.resolve_from(Source::WebMusic, video_id, stream::Format::Aac, None).await {
-                        Ok(s) => return Ok((Source::WebMusic, s)),
-                        Err(e) => log::warn!("web music player failed ({e:#}); using yt-dlp"),
+            Err(first) => {
+                // The visionOS player refuses some songs outright (age-gated, or marked as
+                // made for kids). The web player — signed in when there's an account, and
+                // anonymously otherwise — often still has them, and yt-dlp is the last word
+                // for an account that has one.
+                log::info!("{video_id} visionOS unavailable ({first:#}); trying the web player");
+                match self.resolve_from(Source::WebMusic, video_id, stream::Format::Aac, None).await {
+                    Ok(s) => Ok((Source::WebMusic, s)),
+                    Err(web) => {
+                        log::warn!("{video_id}: the web player refused too ({web:#})");
+                        if self.api.account().is_some()
+                            && let Ok(s) = self.resolve_from(Source::YtDlp, video_id, stream::Format::Aac, None).await
+                        {
+                            return Ok((Source::YtDlp, s));
+                        }
+                        Err(first)
                     }
                 }
-                Ok((Source::YtDlp, self.resolve_from(Source::YtDlp, video_id, stream::Format::Aac, None).await?))
             }
-            Err(e) => Err(e),
         }
     }
 
@@ -1499,8 +1928,18 @@ impl Backend {
         Ok(match source {
             Source::VisionOs => plain(self.visionos_stream(video_id, format == stream::Format::Opus).await?, innertube::UA),
             Source::WebMusic => {
-                let session = self.api.account().ok_or_else(|| anyhow::anyhow!("signed out"))?;
-                plain(session.audio_stream(&self.http(), &self.jsc, video_id).await?, webmusic::UA)
+                if let Some(session) = self.api.account() {
+                    match session.audio_stream(&self.http(), &self.jsc, video_id).await {
+                        Ok(s) => plain(s, webmusic::UA),
+                        // A signed-in answer with no stream still has an anonymous one.
+                        Err(e) => {
+                            log::info!("{video_id}: the signed-in web player refused ({e:#}); asking anonymously");
+                            plain(webmusic::audio_stream_anon(&self.http(), &self.jsc, video_id).await?, webmusic::UA)
+                        }
+                    }
+                } else {
+                    plain(webmusic::audio_stream_anon(&self.http(), &self.jsc, video_id).await?, webmusic::UA)
+                }
             }
             Source::YtDlp => {
                 let session = self.api.account().ok_or_else(|| anyhow::anyhow!("sign in to play this song"))?;
@@ -1602,6 +2041,27 @@ impl Backend {
     /// Webview profile used by the sign-in window.
     pub fn login_profile(&self) -> PathBuf {
         self.data_dir.join("webview")
+    }
+
+    /// youtube.com's "Most replayed" curve for one video: read from the disk while the
+    /// answer there is still in date, and asked once when it isn't. What a failed request
+    /// leaves behind is the last curve kept, however old — a stale one is a better guess
+    /// than none, and a failure is not an answer about the video, so it's kept nowhere.
+    async fn replay_curve(&self, video_id: &str) -> Option<crate::bestpart::Heatmap> {
+        if !crate::bestpart::is_video_id(video_id) {
+            return None;
+        }
+        let mut curves = crate::bestpart::Curves::open(&self.data_dir);
+        if let Some(heat) = curves.fresh(video_id, crate::bestpart::now_ms()) {
+            return heat;
+        }
+        let answer = match tokio::time::timeout(HEATMAP_WAIT, crate::innertube::web_next(&self.http(), video_id)).await {
+            Ok(Ok(answer)) => answer,
+            _ => return curves.stale(video_id),
+        };
+        let heat = crate::bestpart::parse_heatmap(&answer);
+        curves.put(video_id, heat.as_ref(), crate::bestpart::now_ms());
+        heat
     }
 
     /// Report an error from outside the request flow (e.g. the sign-in window).
@@ -1888,12 +2348,17 @@ fn needs_account(e: &anyhow::Error) -> bool {
 }
 
 /// Keep the signed-in release feed's order, using US charts and the user's home artists.
+/// When nothing in this week's releases is by one of them — a small account, or a charts
+/// page that named no artists — the feed is already cut for this listener, so its own
+/// newest releases stand. An empty lead shelf is the worse answer.
 fn popular_new_albums(albums: &[Card], ranked_artists: &[String], preferred_artists: &[String]) -> Vec<Card> {
     let chart_ids: std::collections::HashSet<&str> = ranked_artists.iter().chain(preferred_artists).map(String::as_str).collect();
+    let by_artist = |album: &Card| album.links.iter().any(|a| a.id.as_deref().is_some_and(|id| chart_ids.contains(id)));
+    let ranked = albums.iter().any(by_artist);
     let mut seen = std::collections::HashSet::new();
     albums
         .iter()
-        .filter(|album| album.links.iter().any(|a| a.id.as_deref().is_some_and(|id| chart_ids.contains(id))))
+        .filter(|album| !ranked || by_artist(album))
         .filter(|album| seen.insert(match &album.target {
             Target::Album(id) => id.as_str(),
             _ => album.title.as_str(),
@@ -1941,11 +2406,49 @@ mod explore_tests {
     }
 
     #[test]
+    fn failed_sources_are_filtered_from_both_lyrics_stages() {
+        let source = |provider| lyrics::Lyrics {
+            lines: vec![lyrics::Line { text: "line".into(), ..Default::default() }],
+            sync: lyrics::Sync::None,
+            provider,
+            language: None,
+            songwriters: vec![],
+        };
+        let partial = LyricsSet { sources: vec![source(lyrics::Provider::LrclibPlain), source(lyrics::Provider::UnisonPlain)] };
+        let final_set = LyricsSet { sources: vec![source(lyrics::Provider::LrclibPlain), source(lyrics::Provider::GeniusPlain)] };
+        assert!(prepare_lyrics_response(partial.clone(), Some(" lrclib-plain, unison-plain "), false).is_none());
+        let interim = prepare_lyrics_response(partial, Some("lrclib-plain"), false).unwrap();
+        assert_eq!(interim.sources[0].provider, lyrics::Provider::UnisonPlain);
+        let filtered = prepare_lyrics_response(final_set.clone(), Some("lrclib-plain"), true).unwrap();
+        assert_eq!(filtered.sources[0].provider, lyrics::Provider::GeniusPlain);
+        assert!(prepare_lyrics_response(final_set, Some("lrclib-plain,genius-plain"), true).unwrap().sources.is_empty());
+    }
+
+    #[test]
+    fn genius_about_always_completes_with_the_requested_id() {
+        let missing = finish_genius_about(Some("video".into()), None);
+        assert!(matches!(missing, Some(Resp::GeniusAbout { video_id, description: None }) if video_id == "video"));
+        let answer = Some(Resp::GeniusAbout { video_id: "video".into(), description: Some("A description".into()) });
+        assert!(matches!(finish_genius_about(Some("video".into()), answer), Some(Resp::GeniusAbout { video_id, description: Some(text) }) if video_id == "video" && text == "A description"));
+        assert!(finish_genius_about(None, None).is_none());
+    }
+
+    #[test]
     fn new_releases_only_include_charting_artists_and_deduplicate() {
         let album = |id: &str, artist_id: &str| card(id, Target::Album(id.into()), Some(artist_id), "Album");
         let albums = vec![album("obscure", "other"), album("favorite-release", "favorite"), album("first-release", "popular"), album("second-release", "popular"), album("first-release", "popular")];
         let found = popular_new_albums(&albums, &["popular".into(), "popular".into()], &["favorite".into()]);
         assert_eq!(found.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(), ["favorite-release", "first-release", "second-release"]);
+    }
+
+    #[test]
+    fn new_releases_fall_back_to_the_feed_when_no_artist_charts() {
+        let album = |id: &str| card(id, Target::Album(id.into()), Some("unranked"), "Album");
+        let albums = vec![album("first"), album("second"), album("second")];
+        // A charts page that named no artists, or a small account: the ranked cut would be
+        // empty, so the feed's own newest releases stand rather than an empty shelf.
+        let found = popular_new_albums(&albums, &[], &[]);
+        assert_eq!(found.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(), ["first", "second"]);
     }
 
     #[test]
@@ -1959,7 +2462,7 @@ mod explore_tests {
 
     #[test]
     fn woven_results_keep_ranks_and_drop_repeats() {
-        let t = |id: &str| model::Track { id: id.into(), title: id.into(), artists: vec![], album: None, duration: None, thumbs: vec![], track_nr: None, plays: None, music_video: false };
+        let t = |id: &str| model::Track { id: id.into(), title: id.into(), artists: vec![], album: None, duration: None, thumbs: vec![], track_nr: None, plays: None, music_video: false, episode: false };
         let out = weave(vec![vec![t("s1"), t("s2"), t("s3")], vec![t("v1"), t("s2"), t("v3")]]);
         assert_eq!(out.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), ["s1", "v1", "s2", "s3", "v3"]);
     }

@@ -267,7 +267,7 @@ impl Client {
         anyhow::ensure!(!id.is_empty(), "that URL answered, but not with an addon manifest");
         let resources: Vec<&str> = json.get("resources").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
         anyhow::ensure!(resources.is_empty() || resources.iter().any(|r| r.eq_ignore_ascii_case("search")), "the addon doesn't offer search");
-        let name = json.get("name").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+        let name = json.get("name").and_then(Value::as_str).and_then(addon_name);
         let (defaults, quality) = settings(json.get("settings"));
         let manifest = Manifest { name, defaults, quality };
         *slot = Some(Manifest { name: manifest.name.clone(), defaults: manifest.defaults.clone(), quality: manifest.quality.clone() });
@@ -356,8 +356,10 @@ impl Client {
             anyhow::bail!("the addon's format isn't playable ({codec} {container} {mime})");
         };
         let mut size = json_size(&json);
-        if size == 0 {
-            size = content_size(http, &stated_url).await.unwrap_or(0);
+        // Asked even when the addon states a size: the number says how big the answer
+        // should be, the probe says whether there is one.
+        if let Some(total) = probe_link(http, &stated_url).await? {
+            size = total;
         }
         // Some addon URLs only reveal their size once the stream starts; use a placeholder
         // large enough for ranged reads and let the download determine the real end.
@@ -543,14 +545,22 @@ pub async fn check(http: &reqwest::Client, raw: &str) -> anyhow::Result<String> 
     anyhow::ensure!(!rows.is_empty(), "{name} answered its search with nothing");
     let mut providers: Vec<String> = Vec::new();
     for row in &rows {
-        let provider = if row.provider.is_empty() { row.id.split(':').next().unwrap_or("").to_owned() } else { row.provider.clone() };
-        if !provider.is_empty() && !providers.iter().any(|p| p.eq_ignore_ascii_case(&provider)) {
-            providers.push(provider);
+        // `provider:t_123` names an upstream; a bare `154014286732070912` is only an id,
+        // and listing one reads as a wall of numbers rather than as where the song came from.
+        let provider = match row.provider.is_empty() {
+            true => row.id.split_once(':').filter(|(_, tail)| !tail.is_empty()).map(|(head, _)| head.to_owned()),
+            false => Some(row.provider.clone()),
+        };
+        // A provider line is addon text as much as the name is: the same quota and upgrade
+        // nags turn up in it, and the verdict is shown to the user verbatim.
+        if let Some(p) = provider.filter(|p| !p.is_empty() && !advertises(p) && !providers.iter().any(|q| q.eq_ignore_ascii_case(p))) {
+            providers.push(p);
         }
     }
     let served = providers.join(", ");
+    let served = if served.is_empty() { String::new() } else { format!(" · {served}") };
     match client.open(http, &rows[0], false, false).await {
-        Ok(Some(s)) if usable(&s) => Ok(format!("{name} · {served} · plays {}", s.info.badge())),
+        Ok(Some(s)) if usable(&s) => Ok(format!("{name}{served} · plays {}", s.info.badge())),
         Ok(Some(s)) => anyhow::bail!("{name} streamed {} where its row promised lossless", s.info.details_line()),
         Ok(None) => anyhow::bail!("{name} sent no stream for a test song"),
         Err(e) => anyhow::bail!("{name}: {e}"),
@@ -595,6 +605,23 @@ fn settings(value: Option<&Value>) -> (Vec<(String, String)>, String) {
         }
     }
     (defaults, quality)
+}
+
+/// The addon's name, without the status line it appends to it. These servers publish their
+/// daily quota, the countdown on a free pass and the upgrade nag inside `name`, and that
+/// string is shown as the source of everything the user plays. Only the first separated
+/// part is a name; a first part that still reads as an ad is no name, and the host shows
+/// instead.
+fn addon_name(raw: &str) -> Option<String> {
+    let part = raw.split(['·', '|', '\u{2013}', '\u{2014}']).next()?.trim();
+    (part.len() > 1 && part.len() <= 64 && !advertises(part)).then(|| part.to_owned())
+}
+
+/// The words a quota or promotion line is made of rather than a service's name.
+fn advertises(text: &str) -> bool {
+    let low = text.to_ascii_lowercase();
+    const WORDS: [&str; 13] = ["today", "quota", " left", "free pass", "premium", "vip", "referral", "invite", "upgrade", "requests", "http", "www.", ".com"];
+    WORDS.iter().any(|w| low.contains(w)) || (low.starts_with(|c: char| c.is_ascii_digit()) && low.contains('/'))
 }
 
 fn query_value(v: &Value) -> Option<String> {
@@ -746,8 +773,10 @@ fn format_of(codec: &str, container: &str, mime: &str, url: &str, label: &str) -
 }
 
 fn codec_name(codec: &str, format: &Format) -> String {
+    // The codec is the addon's own string and reaches the quality badge: a nag dressed
+    // up as a codec reads no better than one in the name.
     let codec = codec.trim();
-    if !codec.is_empty() {
+    if !codec.is_empty() && !advertises(codec) {
         return codec.to_ascii_uppercase();
     }
     match format {
@@ -999,7 +1028,7 @@ async fn get_json(http: &reqwest::Client, url: &str, timeout: Duration) -> anyho
         let response = http.get(url).timeout(timeout).header("Accept", "application/json").header("User-Agent", agent()).send().await.map_err(addon_err)?;
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
-            anyhow::bail!("not found");
+            anyhow::bail!("the addon's link was not found");
         }
         if !status.is_success() {
             if status == reqwest::StatusCode::FORBIDDEN {
@@ -1007,7 +1036,7 @@ async fn get_json(http: &reqwest::Client, url: &str, timeout: Duration) -> anyho
                     use_release_agent();
                     continue;
                 }
-                anyhow::bail!("the addon doesn't answer this app");
+                anyhow::bail!("the addon doesn't answer this app's requests");
             }
             let body = response.text().await.unwrap_or_default();
             if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -1019,13 +1048,13 @@ async fn get_json(http: &reqwest::Client, url: &str, timeout: Duration) -> anyho
                 }
                 anyhow::bail!("the addon refused the request (sign-in required)");
             }
-            anyhow::bail!("HTTP {}", status.as_u16());
+            anyhow::bail!("the addon answered with HTTP {}", status.as_u16());
         }
         let bytes = response.bytes().await.map_err(addon_err)?;
         anyhow::ensure!(!bytes.is_empty(), "the addon answered with nothing");
         return Ok(serde_json::from_slice(&bytes)?);
     }
-    anyhow::bail!("the addon doesn't answer this app");
+    anyhow::bail!("the addon doesn't answer this app's requests");
 }
 
 /// Addon links carry a token: a request failure names its kind, never the URL the
@@ -1040,21 +1069,39 @@ fn addon_err(e: reqwest::Error) -> anyhow::Error {
     }
 }
 
-/// How many bytes the stream holds, from a HEAD or a one-byte range request.
-async fn content_size(http: &reqwest::Client, url: &str) -> Option<u64> {
-    if let Ok(response) = http.head(url).timeout(PROBE_TIMEOUT).header("User-Agent", agent()).send().await
-        && response.status().is_success()
-        && let Some(size) = response.content_length().filter(|n| *n > 0)
-    {
-        return Some(size);
+/// What a link is asked for before the player is pointed at it: its size, and whether the
+/// answer is audio at all. A rate-limited, out-of-quota or expired addon link replies with
+/// a small JSON error — or with nothing — under a 200, and 44 bytes of text handed to the
+/// decoder is what users report as a decoding failure. That answer is refused here, so the
+/// addon's next copy, or YouTube, plays instead. A link that doesn't answer in time is
+/// inconclusive: a slow CDN is not a refusal, and refusing it would lose a good copy.
+async fn probe_link(http: &reqwest::Client, url: &str) -> anyhow::Result<Option<u64>> {
+    let mut response = match http.get(url).timeout(PROBE_TIMEOUT).header("User-Agent", agent()).header("Range", "bytes=0-63").header("Accept-Encoding", "identity").send().await {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    let total = response.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok()).and_then(|v| v.rsplit('/').next()).and_then(|s| s.trim().parse::<u64>().ok()).filter(|n| *n > 0);
+    let head = match response.chunk().await {
+        Ok(Some(b)) => b,
+        // No body to judge, but the headers said how big it is: leave it to the download.
+        Ok(None) => return Ok(total.or_else(|| response.content_length().filter(|n| *n > 0))),
+        Err(_) => return Ok(None),
+    };
+    if !response.status().is_success() {
+        anyhow::bail!("the addon's link answered with HTTP {}", response.status().as_u16());
     }
-    let response = http.get(url).timeout(PROBE_TIMEOUT).header("User-Agent", agent()).header("Range", "bytes=0-0").header("Accept-Encoding", "identity").send().await.ok()?;
-    if let Some(range) = response.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok())
-        && let Some(total) = range.rsplit('/').next().and_then(|s| s.trim().parse::<u64>().ok())
-    {
-        return Some(total);
+    if head.is_empty() {
+        anyhow::bail!("the addon's link answered with nothing");
     }
-    response.content_length().filter(|n| *n > 0)
+    if is_refusal(&head) {
+        anyhow::bail!("the addon's link answered with an error, not audio");
+    }
+    Ok(total.or_else(|| response.content_length().filter(|n| *n > 0)))
+}
+
+/// A JSON or HTML answer rather than audio. No audio container begins with one of these.
+fn is_refusal(bytes: &[u8]) -> bool {
+    bytes.iter().find(|b| !b.is_ascii_whitespace()).is_some_and(|&b| matches!(b, b'{' | b'[' | b'<'))
 }
 
 #[cfg(test)]
@@ -1273,5 +1320,29 @@ mod tests {
         assert!(row(serde_json::json!({"audioModes": ["STEREO", "DOLBY_ATMOS"]})));
         assert!(row(serde_json::json!({"quality": "E-AC-3 JOC"})));
         assert!(!row(serde_json::json!({"audioMode": "STEREO", "format": "FLAC"})));
+    }
+
+    #[test]
+    fn an_addons_name_loses_the_status_line_it_carries() {
+        assert_eq!(addon_name("born_legion · 252/350 today · Free Pass 1d 22h left · 2 dev").as_deref(), Some("born_legion"));
+        assert_eq!(addon_name("SoundLink | 41 requests left").as_deref(), Some("SoundLink"));
+        assert_eq!(addon_name("gglos (My setup)").as_deref(), Some("gglos (My setup)"));
+        assert_eq!(addon_name("252/350 today"), None);
+        assert_eq!(addon_name("Free Pass 1d 22h left"), None);
+        assert_eq!(addon_name(""), None);
+        assert_eq!(addon_name(&"n".repeat(80)), None);
+    }
+
+    #[test]
+    fn a_stream_links_error_answer_is_told_from_audio() {
+        assert!(is_refusal(b"{ \"error\": \"oooooooooof beep boop\" }"));
+        assert!(is_refusal(b"   <html>rate limited</html>"));
+        assert!(is_refusal(b"[\n  \"no copy\"\n]"));
+        assert!(!is_refusal(b"fLaC\0\0"));
+        assert!(!is_refusal(b"ID3\x03\x00"));
+        assert!(!is_refusal(b"\x00\x00\x00\x18ftypmp42"));
+        assert!(!is_refusal(b"OggS\x00\x02"));
+        assert!(!is_refusal(b"\xff\xfb\x90\x64"));
+        assert!(!is_refusal(b""));
     }
 }

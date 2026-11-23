@@ -2,6 +2,8 @@
 //! itself gets (see `ytmapi.rs` for the transport): home feed, search, albums,
 //! playlists, artists, radio, charts, the library, and edits to it.
 
+use std::collections::HashSet;
+
 use serde_json::{Value, json};
 
 use crate::backend::{ArtistPage, Collection};
@@ -46,6 +48,7 @@ pub async fn home_more(api: &Api, token: &str, auth: bool) -> anyhow::Result<Hom
 // ----------------------------------------------------------------------- search
 
 /// `search` filters, as the chips on music.youtube.com's results set them.
+#[derive(Clone, Copy)]
 pub enum Filter {
     Songs,
     Albums,
@@ -83,7 +86,19 @@ pub async fn search_songs(api: &Api, query: &str, auth: bool) -> anyhow::Result<
 
 /// Song, video or episode rows under any filter.
 pub async fn search_tracks(api: &Api, query: &str, filter: Filter, auth: bool) -> anyhow::Result<Vec<Track>> {
-    Ok(search_as(api, query, filter, auth).await?.iter().filter_map(|i| list_item(&i["musicResponsiveListItemRenderer"])).collect())
+    let tracks = search_as(api, query, filter, auth).await?.iter().filter_map(|i| list_item(&i["musicResponsiveListItemRenderer"])).collect();
+    Ok(mark_episodes(filter, tracks))
+}
+
+/// Asked as episodes, they are: a row's badge isn't always sent, and the answer to an
+/// episodes search holds nothing else.
+fn mark_episodes(filter: Filter, mut tracks: Vec<Track>) -> Vec<Track> {
+    if matches!(filter, Filter::Episodes) {
+        for t in &mut tracks {
+            t.episode = true;
+        }
+    }
+    tracks
 }
 
 /// Song or video rows, searched as the signed-in account: signed-out searches miss
@@ -102,6 +117,21 @@ pub struct Suggestion {
     /// A past search of the signed-in account: the token that removes it from the
     /// account's search history.
     pub forget: Option<String>,
+    /// The row names a thing rather than a term: the song, artist, album or video the
+    /// query has already found.
+    pub thing: Option<Thing>,
+}
+
+/// A named suggestion: what it is, who by, the artwork beside it and where the row goes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Thing {
+    /// "Song", "Music Video", "Album", "Artist" — the word the row puts first.
+    pub kind: String,
+    /// Whoever it names after the kind.
+    pub by: String,
+    pub thumbs: Vec<Thumb>,
+    pub explicit: bool,
+    pub target: Target,
 }
 
 /// Search terms for `input`. Signed in, the account's matching past searches come
@@ -112,9 +142,7 @@ pub async fn suggestions(api: &Api, input: &str, auth: bool) -> anyhow::Result<V
 }
 
 fn parse_suggestions(v: &Value) -> Vec<Suggestion> {
-    // A second section holds songs and artists, which the dropdown doesn't show.
-    let items = &v["contents"][0]["searchSuggestionsSectionRenderer"]["contents"];
-    arr(items)
+    let mut out: Vec<Suggestion> = arr(&v["contents"][0]["searchSuggestionsSectionRenderer"]["contents"])
         .iter()
         .filter_map(|i| {
             let past = &i["historySuggestionRenderer"];
@@ -122,9 +150,64 @@ fn parse_suggestions(v: &Value) -> Vec<Suggestion> {
             Some(Suggestion {
                 text: text(&r["suggestion"])?,
                 forget: past["serviceEndpoint"]["feedbackEndpoint"]["feedbackToken"].as_str().map(str::to_owned),
+                thing: None,
             })
         })
-        .collect()
+        .collect();
+    out.extend(arr(&v["contents"][1]["searchSuggestionsSectionRenderer"]["contents"]).iter().filter_map(named));
+    out
+}
+
+/// One row of the second section. Its name and its kind arrive as runs of two flexible
+/// columns — "Song", " • ", the artist, " • ", the play count — and it navigates to the
+/// thing itself, which is what makes it more than the term it starts with.
+fn named(item: &Value) -> Option<Suggestion> {
+    let r = &item["musicResponsiveListItemRenderer"];
+    let col = |i: usize| -> Vec<String> {
+        arr(&r["flexColumns"][i]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"])
+            .iter()
+            .filter_map(|x| x["text"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let title = col(0).join("");
+    if title.is_empty() {
+        return None;
+    }
+    let meta = col(1);
+    let artist = meta.get(2).cloned().unwrap_or_default();
+    let browse = r["navigationEndpoint"]["browseEndpoint"]["browseId"].as_str();
+    let video = r["navigationEndpoint"]["watchEndpoint"]["videoId"]
+        .as_str()
+        .or_else(|| r["playlistItemData"]["videoId"].as_str());
+    let thumbs = thumbs(&r["thumbnail"]["musicThumbnailRenderer"]);
+    let explicit = arr(&r["badges"]).iter().any(|b| b["musicInlineBadgeRenderer"]["icon"]["iconType"] == "MUSIC_EXPLICIT_BADGE");
+    let (kind, by, target) = match (browse, video) {
+        (Some(id), _) if id.starts_with("UC") => (String::from("Artist"), String::new(), Target::Artist(id.to_owned())),
+        (Some(id), _) => (meta.first().cloned().unwrap_or_else(|| String::from("Album")), artist, Target::Album(id.to_owned())),
+        (None, Some(id)) => {
+            // A row saying "Video" is the clip, not the song: it plays as one and is
+            // named as the reference names it.
+            let clip = meta.first().is_some_and(|k| k == "Video");
+            (
+                String::from(if clip { "Music Video" } else { "Song" }),
+                artist.clone(),
+                Target::Song(Track {
+                    id: id.to_owned(),
+                    title: title.clone(),
+                    artists: if artist.is_empty() { vec![] } else { vec![Link { name: artist, id: None }] },
+                    album: None,
+                    duration: None,
+                    thumbs: thumbs.clone(),
+                    track_nr: None,
+                    plays: None,
+                    music_video: clip,
+                    episode: false,
+                }),
+            )
+        }
+        _ => return None,
+    };
+    Some(Suggestion { text: title, forget: None, thing: Some(Thing { kind, by, thumbs, explicit, target }) })
 }
 
 /// Remove a past search from the account's search history.
@@ -156,7 +239,20 @@ pub async fn paired_song(api: &Api, video_id: &str) -> anyhow::Result<Option<Tra
     Ok(parse_paired_song(&v, video_id))
 }
 
+/// The music-video version of a song, from YouTube's own pair: the queue wraps a song
+/// together with its official video the same way it wraps a video together with its
+/// song. Other accounts get no pairs, so this is `None` for them.
+pub async fn paired_video(api: &Api, song_id: &str) -> anyhow::Result<Option<Track>> {
+    let body = json!({"videoId": song_id, "isAudioOnly": false, "enablePersistentPlaylistPanel": true});
+    let v = api.call_signed_in("next", body).await?;
+    Ok(parse_paired(&v, song_id, "MUSIC_VIDEO_TYPE_OMV"))
+}
+
 fn parse_paired_song(v: &Value, video_id: &str) -> Option<Track> {
+    parse_paired(v, video_id, "MUSIC_VIDEO_TYPE_ATV")
+}
+
+fn parse_paired(v: &Value, video_id: &str, want: &str) -> Option<Track> {
     let panel = &v["contents"]["singleColumnMusicWatchNextResultsRenderer"]["tabbedRenderer"]["watchNextTabbedResultsRenderer"]["tabs"][0]
         ["tabRenderer"]["content"]["musicQueueRenderer"]["content"]["playlistPanelRenderer"];
     arr(&panel["contents"])
@@ -165,7 +261,7 @@ fn parse_paired_song(v: &Value, video_id: &str) -> Option<Track> {
         .filter(|w| w["primaryRenderer"]["playlistPanelVideoRenderer"]["videoId"] == video_id)
         .flat_map(|w| arr(&w["counterpart"]))
         .map(|c| &c["counterpartRenderer"]["playlistPanelVideoRenderer"])
-        .find(|r| video_type(&[&r["navigationEndpoint"]]) == Some("MUSIC_VIDEO_TYPE_ATV"))
+        .find(|r| video_type(&[&r["navigationEndpoint"]]) == Some(want))
         .and_then(panel_item)
 }
 
@@ -496,6 +592,10 @@ pub async fn playlist(api: &Api, id: &str, auth: bool, limit: Option<usize>) -> 
 pub async fn playlist_start(api: &Api, id: &str, auth: bool, limit: Option<usize>) -> anyhow::Result<(Collection, Option<String>, usize)> {
     let v = api.call("browse", json!({ "browseId": format!("VL{id}") }), auth).await?;
     let Some((mut pl, token, count)) = parse_playlist(&v, id) else {
+        // Dev hook: YTM_DUMP=<file> keeps the page that refused to parse.
+        if let Some(path) = std::env::var_os("YTM_DUMP") {
+            let _ = std::fs::write(path, v.to_string());
+        }
         // A session Google has revoked still gets answers, just signed-out ones.
         anyhow::ensure!(!(auth && api.account().is_some() && crate::ytmapi::logged_out(&v)), "Your YouTube sign-in has expired");
         anyhow::bail!("YouTube Music returned an empty playlist");
@@ -598,20 +698,81 @@ fn list_page(items: &[Value]) -> (Vec<Track>, Vec<Option<String>>, Option<String
 
 pub async fn artist(api: &Api, id: &str) -> anyhow::Result<ArtistPage> {
     let v = api.call("browse", json!({ "browseId": id }), false).await?;
-    parse_artist(&v, id).ok_or_else(|| anyhow::anyhow!("YouTube Music returned an empty artist page"))
+    let mut page = parse_artist(&v, id).ok_or_else(|| anyhow::anyhow!("YouTube Music returned an empty artist page"))?;
+    // A page's carousels hold only the rowful that fits; each release shelf's title links
+    // to the page that holds the rest, which is what "Show all" is meant to list.
+    for (browse, params) in release_endpoints(&v) {
+        let body = if params.is_empty() { json!({ "browseId": browse }) } else { json!({ "browseId": browse, "params": params }) };
+        let Ok(all) = api.call("browse", body, false).await else { continue };
+        let mut cards = Vec::new();
+        collect_cards(&all, &mut cards);
+        for card in cards {
+            if matches!(card.target, Target::Album(_)) && !page.albums.iter().any(|a| a.target == card.target) {
+                page.albums.push(card);
+            }
+        }
+    }
+    Ok(page)
+}
+
+/// The endpoints that answer with an artist's whole release lists. YouTube names each one
+/// by its page type rather than by a shelf's wording, so the search doesn't care what
+/// language the page is in or which row of the page a release shelf sits in.
+fn release_endpoints(v: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    find_discography(v, &mut out);
+    out
+}
+
+fn find_discography(v: &Value, out: &mut Vec<(String, String)>) {
+    match v {
+        Value::Object(map) => {
+            if let Some(ep) = map.get("browseEndpoint").filter(|ep| {
+                ep["browseEndpointContextSupportedConfigs"]["browseEndpointContextMusicConfig"]["pageType"].as_str()
+                    == Some("MUSIC_PAGE_TYPE_ARTIST_DISCOGRAPHY")
+            }) {
+                if let Some(browse) = ep["browseId"].as_str() {
+                    let params = ep["params"].as_str().unwrap_or_default().to_owned();
+                    if !out.iter().any(|(b, p)| b == browse && *p == params) {
+                        out.push((browse.to_owned(), params));
+                    }
+                }
+            }
+            for child in map.values() {
+                find_discography(child, out);
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|i| find_discography(i, out)),
+        _ => {}
+    }
+}
+
+/// Every card an answer holds, wherever its shelf hides it: a "more" page lists its
+/// releases in a block of its own rather than in the artist page's carousel.
+fn collect_cards(v: &Value, out: &mut Vec<Card>) {
+    match v {
+        Value::Object(map) => {
+            for (k, child) in map {
+                match k.as_str() {
+                    "musicTwoRowItemRenderer" => out.extend(two_row(child)),
+                    "musicResponsiveListItemRenderer" => out.extend(list_card(child)),
+                    _ => collect_cards(child, out),
+                }
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|i| collect_cards(i, out)),
+        _ => {}
+    }
 }
 
 fn parse_artist(v: &Value, id: &str) -> Option<ArtistPage> {
     let h = ["musicImmersiveHeaderRenderer", "musicVisualHeaderRenderer"].iter().map(|k| &v["header"][*k]).find(|h| !h.is_null())?;
     let name = text(&h["title"])?;
-    let sub = &h["subscriptionButton"]["subscribeButtonRenderer"];
-    let subscribers = text(&sub["subscriberCountText"]).or_else(|| text(&sub["shortSubscriberCountText"])).and_then(|t| count(&t));
     let sections = arr(&v["contents"]["singleColumnBrowseResultsRenderer"]["tabs"][0]["tabRenderer"]["content"]["sectionListRenderer"]["contents"]);
     let me = Link { name: name.clone(), id: Some(id.to_owned()) };
     let mut page = ArtistPage {
         id: id.to_owned(),
         banner: thumbs(&h["thumbnail"]["musicThumbnailRenderer"]),
-        subscribers,
         description: text(&h["description"]),
         top: Vec::new(),
         top_playlist: None,
@@ -644,7 +805,8 @@ fn parse_artist(v: &Value, id: &str) -> Option<ArtistPage> {
                 }
                 Target::Playlist(_) => page.playlists.push(card),
                 Target::Artist(_) => page.similar.push(card),
-                Target::Song(_) => {}
+                // A YouTube Music page never carries Apple's tiles.
+                Target::Song(_) | Target::Apple { .. } => {}
             }
         }
     }
@@ -753,7 +915,12 @@ fn parse_charts(v: &Value) -> Charts {
     let mut c = Charts { top: Vec::new(), playlists: Vec::new(), artists: Vec::new() };
     let sections = &v["contents"]["singleColumnBrowseResultsRenderer"]["tabs"][0]["tabRenderer"]["content"]["sectionListRenderer"]["contents"];
     for s in arr(sections) {
-        for i in arr(&s["musicCarouselShelfRenderer"]["contents"]).iter().filter(|i| !is_video(i)) {
+        // The charts page runs its videos, its genres, its artists and its podcasts through
+        // carousels, and the videos' own rows are marked as videos. Only a video chart's rows
+        // are dropped for that: the artist chart keeps rows that point at a watch page.
+        let title = text(&s["musicCarouselShelfRenderer"]["header"]["musicCarouselShelfBasicHeaderRenderer"]["title"]).unwrap_or_default().to_lowercase();
+        let songs = title.contains("song") || title.contains("artist");
+        for i in arr(&s["musicCarouselShelfRenderer"]["contents"]).iter().filter(|i| songs || !is_video(i)) {
             if let Some(card) = two_row(&i["musicTwoRowItemRenderer"]) {
                 if matches!(card.target, Target::Playlist(_)) {
                     c.playlists.push(card);
@@ -786,6 +953,91 @@ fn grid_cards(sections: &[Value]) -> Vec<Card> {
         .flat_map(|s| arr(&s["gridRenderer"]["items"]))
         .filter_map(|i| two_row(&i["musicTwoRowItemRenderer"]))
         .collect()
+}
+
+/// A one-column browse page's shelf sections: home, a mood category, a list of albums.
+fn sections(v: &Value) -> &[Value] {
+    arr(&v["contents"]["singleColumnBrowseResultsRenderer"]["tabs"][0]["tabRenderer"]["content"]["sectionListRenderer"]["contents"])
+}
+
+// ----------------------------------------------------------------------- moods
+
+/// Every mood and genre page is the same browse id; its params say which one.
+const CATEGORY: &str = "FEmusic_moods_and_genres_category";
+/// How many of a mood's playlists a station plays.
+const MOOD_PLAYLISTS: usize = 3;
+/// And how long the queue it makes is.
+const MOOD_QUEUE: usize = 60;
+
+/// A mood Explore offers, with the params its page opens with.
+#[derive(Clone, Debug)]
+pub struct Mood {
+    pub name: String,
+    pub params: String,
+}
+
+/// The mood and genre grid, in the server's order and in its spelling — so the names are
+/// the ones this account's language actually uses.
+pub async fn moods(api: &Api, auth: bool) -> anyhow::Result<Vec<Mood>> {
+    let v = api.call("browse", json!({ "browseId": "FEmusic_moods_and_genres" }), auth).await?;
+    let mut out: Vec<Mood> = Vec::new();
+    for item in sections(&v).iter().flat_map(|s| arr(&s["gridRenderer"]["items"])) {
+        let b = &item["musicNavigationButtonRenderer"];
+        let ep = &b["clickCommand"]["browseEndpoint"];
+        if ep["browseId"].as_str() != Some(CATEGORY) {
+            continue;
+        }
+        if let (Some(name), Some(params)) = (text(&b["buttonText"]), ep["params"].as_str())
+            && !out.iter().any(|m| m.name == name)
+        {
+            out.push(Mood { name, params: params.to_owned() });
+        }
+    }
+    anyhow::ensure!(!out.is_empty(), "YouTube Music's mood grid came back empty");
+    Ok(out)
+}
+
+/// A mood played as a station: the shelf of its playlists that names the mood best,
+/// three of them drawn at random, and their songs shuffled into one queue.
+///
+/// Not the home feed filtered by the mood's params — that shows shelves and plays
+/// nothing — and not a radio seeded from one of them, which wanders off the feeling
+/// within a few tracks. Ported from BitChord's `moodQueue` (v1.10); keep the two in step.
+pub async fn mood_station(api: &Api, mood: &Mood, auth: bool) -> anyhow::Result<Vec<Track>> {
+    let v = api.call("browse", json!({ "browseId": CATEGORY, "params": &mood.params }), auth).await?;
+    let name = mood.name.to_lowercase();
+    // Shelves of playlists, keeping the ones whose title carries the most of the mood's
+    // words; a category whose shelves name it nowhere is drawn from at random.
+    let mut best = 0usize;
+    let mut tied: Vec<Vec<String>> = Vec::new();
+    for shelf in sections(&v).iter().filter_map(shelf) {
+        let ShelfKind::Cards(cards) = &shelf.kind else { continue };
+        let ids: Vec<String> = cards.iter().filter_map(|c| match &c.target { Target::Playlist(id) => Some(id.clone()), _ => None }).collect();
+        if ids.is_empty() {
+            continue;
+        }
+        let title = shelf.title.to_lowercase();
+        let score = name.split_whitespace().filter(|w| title.contains(w)).count();
+        if score > best {
+            best = score;
+            tied.clear();
+        }
+        if score == best {
+            tied.push(ids);
+        }
+    }
+    anyhow::ensure!(!tied.is_empty(), "YouTube Music has no playlists for {}", mood.name);
+    crate::model::shuffle(&mut tied);
+    let mut ids = tied.remove(0);
+    ids.truncate(6);
+    crate::model::shuffle(&mut ids);
+    let pages = futures_util::future::join_all(ids.into_iter().take(MOOD_PLAYLISTS).map(|id| async move { playlist(api, &id, auth, Some(MOOD_QUEUE)).await.map(|c| c.tracks).unwrap_or_default() })).await;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut tracks: Vec<Track> = pages.into_iter().flatten().filter(|t| seen.insert(t.id.clone())).collect();
+    anyhow::ensure!(!tracks.is_empty(), "{}'s playlists were empty", mood.name);
+    crate::model::shuffle(&mut tracks);
+    tracks.truncate(MOOD_QUEUE);
+    Ok(tracks)
 }
 
 // ------------------------------------------------------------------------ library
@@ -1240,7 +1492,9 @@ fn shelf(s: &Value) -> Option<Shelf> {
         return None;
     }
     let h = &r["header"]["musicCarouselShelfBasicHeaderRenderer"];
-    let title = text(&h["title"])?;
+    // A mood's own category gives its rows no title text at all, only the words spoken
+    // for screen readers. They are the same words, so the label names the shelf.
+    let title = text(&h["title"]).or_else(|| h["accessibilityData"]["accessibilityData"]["label"].as_str().map(str::to_owned))?;
     let strapline = text(&h["strapline"]);
     let strap_thumb = thumbs(&h["thumbnail"]["musicThumbnailRenderer"]).into_iter().next().map(|t| t.url);
     let items: Vec<&Value> = arr(&r["contents"]).iter().filter(|i| !is_video(i)).collect();
@@ -1275,6 +1529,7 @@ fn two_row(r: &Value) -> Option<Card> {
             track_nr: None,
             plays: None,
             music_video: music_video(&[nav]),
+            episode: false,
         })
     } else if let Some(playlist) = nav["watchPlaylistEndpoint"]["playlistId"].as_str() {
         Target::Playlist(playlist.to_owned())
@@ -1359,6 +1614,7 @@ fn list_item(r: &Value) -> Option<Track> {
     let mut album = None;
     let mut duration = None;
     let mut plays = None;
+    let mut episode = false;
     let mut in_artists = true;
     for c in 1..cols.len() {
         for (i, run) in runs(col(c)?).enumerate() {
@@ -1368,7 +1624,8 @@ fn list_item(r: &Value) -> Option<Track> {
                 match name.trim() {
                     "•" => in_artists = false,
                     "" | "," | "&" => {}
-                    "Song" | "Video" | "Episode" if i == 0 => {}
+                    "Song" | "Video" if i == 0 => {}
+                    "Episode" if i == 0 => episode = true,
                     n if kind.is_none_or(|k| k == "MUSIC_PAGE_TYPE_ARTIST" || k == "MUSIC_PAGE_TYPE_USER_CHANNEL") && !looks_like_duration(n) && !n.ends_with(" plays") => {
                         artists.push(Link { name: n.to_owned(), id: browse_id(run) })
                     }
@@ -1397,7 +1654,7 @@ fn list_item(r: &Value) -> Option<Track> {
     }
     let track_nr = text(&r["index"]).and_then(|n| n.parse().ok());
     let music_video = music_video(&[&r["overlay"], &r["flexColumns"][0]]);
-    Some(Track { id, title, artists, album, duration, thumbs: thumbs(&r["thumbnail"]["musicThumbnailRenderer"]), track_nr, plays, music_video })
+    Some(Track { id, title, artists, album, duration, thumbs: thumbs(&r["thumbnail"]["musicThumbnailRenderer"]), track_nr, plays, music_video, episode })
 }
 
 /// A song in a radio / up-next panel.
@@ -1424,6 +1681,7 @@ fn panel_item(r: &Value) -> Option<Track> {
         track_nr: None,
         plays: None,
         music_video: music_video(&[&r["navigationEndpoint"]]),
+        episode: false,
     })
 }
 
@@ -1474,7 +1732,7 @@ fn runs(v: &Value) -> impl Iterator<Item = &Value> {
 
 fn text(v: &Value) -> Option<String> {
     let s: String = runs(v).filter_map(|r| r["text"].as_str()).collect();
-    (!s.is_empty()).then_some(s)
+    if !s.is_empty() { Some(s) } else { v["simpleText"].as_str().filter(|s| !s.is_empty()).map(str::to_owned) }
 }
 
 fn thumbs(r: &Value) -> Vec<Thumb> {
@@ -1502,6 +1760,25 @@ fn browse_id(run: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_mood_chips_accept_simple_text_and_keep_their_params() {
+        let value = json!({"contents":{"singleColumnBrowseResultsRenderer":{"tabs":[{"tabRenderer":{"content":{"sectionListRenderer":{
+            "header":{"chipCloudRenderer":{"chips":[
+                {"chipCloudChipRenderer":{"text":{"simpleText":"Focus"},"navigationEndpoint":{"browseEndpoint":{"params":"focus-params"}}}},
+                {"chipCloudChipRenderer":{"text":{"runs":[{"text":"Relax"}]},"isSelected":true,"onDeselectedCommand":{"browseEndpoint":{}}}}
+            ]}},
+            "contents":[]
+        }}}}]}}});
+        let home = parse_home(&value);
+        assert_eq!(home.chips.len(), 2);
+        assert_eq!(home.chips[0].title, "Focus");
+        assert_eq!(home.chips[0].params.as_deref(), Some("focus-params"));
+        assert!(!home.chips[0].selected);
+        assert_eq!(home.chips[1].title, "Relax");
+        assert!(home.chips[1].selected);
+        assert_eq!(home.chips[1].params, None);
+    }
 
     /// An `accountItem` as the account switcher lists it.
     fn account_item(name: &str, handle: Option<&str>, selected: bool, page: Option<&str>, datasync: &str) -> Value {
@@ -1607,10 +1884,64 @@ mod tests {
         assert_eq!(
             parse_suggestions(&v),
             [
-                Suggestion { text: "lofi beats".into(), forget: Some("tok".into()) },
-                Suggestion { text: "love songs".into(), forget: None },
+                Suggestion { text: "lofi beats".into(), forget: Some("tok".into()), thing: None },
+                Suggestion { text: "love songs".into(), forget: None, thing: None },
             ]
         );
+    }
+
+    #[test]
+    fn the_second_section_names_the_things_already_found() {
+        // The rows under the terms: a song, an artist and a video, as the API sends them.
+        let row = |runs: &[&str], end: Value, badge: bool| -> Value {
+            json!({"musicResponsiveListItemRenderer": {
+                "flexColumns": [
+                    {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": runs[0]}]}}},
+                    {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [
+                        {"text": runs[1]}, {"text": " • "}, {"text": runs[2]}]}}}
+                ],
+                "thumbnail": {"musicThumbnailRenderer": {"thumbnail": {"thumbnails": [{"url": "https://i.ytimg.com/a/s0.jpg", "width": 60, "height": 60}]}}},
+                "badges": if badge { json!([{"musicInlineBadgeRenderer": {"icon": {"iconType": "MUSIC_EXPLICIT_BADGE"}}}]) } else { json!([]) },
+                "navigationEndpoint": end,
+            }})
+        };
+        let v = json!({"contents": [
+            {"searchSuggestionsSectionRenderer": {"contents": []}},
+            {"searchSuggestionsSectionRenderer": {"contents": [
+                row(&["Blue Eyes", "Song", "Ella Mai"], json!({"watchEndpoint": {"videoId": "dQw4"}}), true),
+                row(&["Ella Mai", "Artist", "239M monthly audience"], json!({"browseEndpoint": {"browseId": "UCzz"}}), false),
+                row(&["Chapter II", "Album", "Ella Mai"], json!({"browseEndpoint": {"browseId": "MPREb_1"}}), false),
+                row(&["Blue Eyes", "Video", "Ella Mai"], json!({"watchEndpoint": {"videoId": "dQw4"}}), false),
+            ]}}
+        ]});
+        let things: Vec<(String, String, bool, String)> = parse_suggestions(&v)
+            .into_iter()
+            .map(|s| {
+                let t = s.thing.expect("entity row");
+                let id = match &t.target {
+                    Target::Song(tr) => tr.id.clone(),
+                    Target::Album(id) | Target::Artist(id) => id.clone(),
+                    other => format!("{other:?}"),
+                };
+                (t.kind, t.by, t.explicit, id)
+            })
+            .collect();
+        assert_eq!(
+            things,
+            [
+                ("Song".into(), "Ella Mai".into(), true, "dQw4".into()),
+                ("Artist".into(), "".into(), false, "UCzz".into()),
+                ("Album".into(), "Ella Mai".into(), false, "MPREb_1".into()),
+                ("Music Video".into(), "Ella Mai".into(), false, "dQw4".into()),
+            ]
+        );
+        // A song row plays like the song it is, artwork and all.
+        let song = parse_suggestions(&v)[0].thing.clone().unwrap();
+        assert_eq!(song.thumbs.len(), 1);
+        match song.target {
+            Target::Song(t) => assert_eq!(t.artists[0].name, "Ella Mai"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -1919,6 +2250,7 @@ mod tests {
             track_nr: None,
             plays: None,
             music_video: false,
+            episode: false,
         }
     }
 
@@ -2021,7 +2353,7 @@ mod tests {
 
     #[test]
     fn a_radio_is_its_songs_or_its_videos_when_it_has_only_those() {
-        let t = |id: &str| Track { id: id.into(), title: id.into(), artists: Vec::new(), album: None, duration: None, thumbs: Vec::new(), track_nr: None, plays: None, music_video: false };
+        let t = |id: &str| Track { id: id.into(), title: id.into(), artists: Vec::new(), album: None, duration: None, thumbs: Vec::new(), track_nr: None, plays: None, music_video: false, episode: false };
         let ids = |items: &[(Track, bool)]| radio_tracks(items).map(|t| t.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&[(t("a"), false), (t("v"), true), (t("b"), false)]), ["a", "b"]);
         // A music video's radio: music videos only, kept rather than nothing.
@@ -2038,6 +2370,26 @@ mod tests {
         assert!(!row("MUSIC_VIDEO_TYPE_UGC"));
     }
 
+    #[test]
+    fn a_row_badged_episode_is_no_song() {
+        let col = |texts: &[&str]| json!({"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": texts.iter().map(|t| json!({"text": t})).collect::<Vec<_>>()}}});
+        let row = |badge: &str| {
+            let v = json!({"musicResponsiveListItemRenderer": {
+                "flexColumns": [col(&["The moral of the story"]), col(&[badge, " • ", "This Week in Tech"])],
+                "playlistItemData": {"videoId": "x"},
+            }});
+            list_item(&v["musicResponsiveListItemRenderer"]).unwrap()
+        };
+        assert!(row("Episode").episode);
+        assert!(!row("Episode").is_song());
+        // A song row wears the song badge, or none.
+        assert!(row("Song").is_song());
+        // An episodes search marks its rows even where the badge is missing; a songs one
+        // leaves them alone.
+        assert!(!mark_episodes(Filter::Episodes, vec![row("Song")])[0].is_song());
+        assert!(mark_episodes(Filter::Songs, vec![row("Song")])[0].is_song());
+    }
+
     /// A signed-out search for the songs of a few music videos. Run alone:
     /// `cargo test --bin ytm-rs -- --ignored ytm::tests::searched_song_live --exact --nocapture`
     #[tokio::test]
@@ -2045,7 +2397,7 @@ mod tests {
     async fn searched_song_live() {
         let api = crate::ytmapi::Api::new(&std::env::temp_dir().join("ytm-rs-album-songs-test"));
         for v in [
-            video("Never Gonna Give You Up", &["Rick Astley"], 214),
+            video("Get Lucky (Radio Edit)", &["Daft Punk", "Pharrell Williams"], 248),
             video("Take On Me (Official Video)", &["a-ha"], 244),
             video("Kisi Nazar Ko Tera Intezar", &["Asha Bhosle"], 452),
             video("Bad Guy", &["Billie Eilish"], 207),
@@ -2054,6 +2406,222 @@ mod tests {
             println!("{} -> {:?}", v.title, found.as_ref().map(|s| (&s.id, &s.title, s.artist_line(), s.duration)));
         }
     }
+
+    /// A radio, the way autoplay asks for one at the end of a song. Run alone:
+    /// `cargo test --release -- --ignored ytm::tests::radio_live --exact --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn radio_live() {
+        let api = crate::ytmapi::Api::new(&std::env::temp_dir().join("ytm-rs-radio-test"));
+        for query in ["Tate McRae greedy", "Fleetwood Mac Dreams"] {
+            let songs = search_songs(&api, query, false).await.unwrap();
+            let Some(seed) = songs.first() else {
+                println!("{query}: no search results");
+                continue;
+            };
+            let tracks = radio(&api, &seed.id, false, 50).await.unwrap();
+            println!(
+                "{query} -> seed {} ({}), {} radio songs: {:?}",
+                seed.id,
+                seed.title,
+                tracks.len(),
+                tracks.iter().take(5).map(|t| (&t.title, &t.id)).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The whole discography, asked for an artist of many releases. Run alone:
+    /// `cargo test -- --ignored ytm::tests::artist_releases_live --exact --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn artist_releases_live() {
+        let api = crate::ytmapi::Api::new(&std::env::temp_dir().join("ytm-rs-artist-releases-test"));
+        let artists = search_cards(&api, "Ariana Grande", Filter::Artists, false).await.unwrap();
+        let Target::Artist(id) = &artists[0].target else { panic!("no artist in {artists:?}") };
+        let page = artist(&api, id).await.unwrap();
+        let titles: Vec<&str> = page.albums.iter().map(|c| c.title.as_str()).collect();
+        println!("{id}: {} releases\n{titles:#?}", page.albums.len());
+        assert!(page.albums.len() > 30, "the discography is still only the shelf's rowful");
+    }
+
+    /// Whether a mood chip's params actually change the feed. Run alone:
+    /// `cargo test -- --ignored ytm::tests::home_mood_feed_live --exact --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn home_mood_feed_live() {
+        let api = crate::ytmapi::Api::new(&std::env::temp_dir().join("ytm-rs-mood-feed-test"));
+        let plain = home(&api, None, false).await.unwrap();
+        let titled = |p: &HomePage| -> Vec<String> {
+            p.shelves.iter().map(|s| format!("{} ({})", s.title, match &s.kind {
+                ShelfKind::Cards(c) => c.len(),
+                ShelfKind::Songs { tracks, rows } => tracks.len() / (*rows).max(1),
+            })).collect::<Vec<_>>()
+        };
+        println!("chips: {:?}", plain.chips.iter().map(|c| (&c.title, c.params.is_some(), c.selected)).collect::<Vec<_>>());
+        println!("plain: {}", titled(&plain).join(" | "));
+        for chip in plain.chips.iter().filter(|c| c.params.is_some()).take(3) {
+            let filtered = home(&api, chip.params.as_deref(), false).await.unwrap();
+            println!("{} -> {} shelves: {}", chip.title, filtered.shelves.len(), titled(&filtered).join(" | "));
+        }
+    }
+
+    /// Whether a mood actually plays: the moods Explore lists, and the queue three of a
+    /// mood's playlists makes. Prints names and titles only. Run alone:
+    /// `cargo test --release -- --ignored ytm::tests::mood_station_live --exact --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn mood_station_live() {
+        let api = crate::ytmapi::Api::new(&crate::data_dir());
+        let list = moods(&api, true).await.unwrap();
+        println!("{} moods: {:?}", list.len(), list.iter().map(|m| m.name.as_str()).collect::<Vec<_>>());
+        for mood in list.iter().take(3) {
+            match mood_station(&api, mood, true).await {
+                Ok(tracks) => println!("{}: {} tracks, e.g. {:?}", mood.name, tracks.len(), tracks.iter().take(3).map(|t| t.title.as_str()).collect::<Vec<_>>()),
+                Err(e) => {
+                    println!("{}: failed ({e})", mood.name);
+                    // What the category holds when a station comes up empty: which renderers
+                    // the answer is built out of at all, and the words of the first cards.
+                    let v = api.call("browse", json!({ "browseId": CATEGORY, "params": &mood.params }), true).await.unwrap();
+                    let mut names: std::collections::BTreeMap<String, usize> = Default::default();
+                    walk_renderers(&v, &mut names);
+                    println!("   sections:{} renderers:{:?}", sections(&v).len(), names);
+                    println!("   titles:{:?}", sections(&v).iter().filter_map(shelf).map(|s| s.title.clone()).collect::<Vec<_>>());
+                    for shelf in sections(&v).iter().filter_map(shelf) {
+                        if let ShelfKind::Cards(cards) = &shelf.kind {
+                            let kind = |c: &Card| match &c.target {
+                                Target::Playlist(_) => "playlist",
+                                Target::Album(_) => "album",
+                                Target::Artist(_) => "artist",
+                                Target::Song(_) => "song",
+                                Target::Apple { .. } => "apple",
+                            };
+                            println!("   [{}] {}", shelf.title, cards.iter().take(3).map(|c| format!("{:?}/{}", c.title, kind(c))).collect::<Vec<_>>().join(" | "));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every `*Renderer` key in an answer and how often it appears: the shape of a page
+    /// without its words or addresses.
+    fn walk_renderers(v: &Value, names: &mut std::collections::BTreeMap<String, usize>) {
+        match v {
+            Value::Object(o) => {
+                for (k, child) in o {
+                    if k.ends_with("Renderer") {
+                        *names.entry(k.clone()).or_default() += 1;
+                    }
+                    walk_renderers(child, names);
+                }
+            }
+            Value::Array(a) => {
+                for c in a {
+                    walk_renderers(c, names);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// What the moods are made of, as the signed-in account sees them: whether a chip's
+    /// params change *its* feed (anonymous ones do), and what the server's own mood and
+    /// genre categories hold — the categories, and the shelves behind one of them.
+    /// `cargo test --release -- --ignored ytm::tests::moods_live --exact --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn moods_live() {
+        let api = crate::ytmapi::Api::new(&crate::data_dir());
+        let titled = |p: &HomePage| -> Vec<String> {
+            p.shelves.iter().map(|s| format!("{} ({})", s.title, match &s.kind {
+                ShelfKind::Cards(c) => c.len(),
+                ShelfKind::Songs { tracks, rows } => tracks.len() / (*rows).max(1),
+            })).collect::<Vec<_>>()
+        };
+        let mine = home(&api, None, true).await.unwrap();
+        println!("signed-in chips: {:?}", mine.chips.iter().map(|c| (&c.title, c.params.is_some(), c.selected)).collect::<Vec<_>>());
+        println!("signed-in plain: {}", titled(&mine).join(" | "));
+        for chip in mine.chips.iter().filter(|c| c.params.is_some()).take(3) {
+            let filtered = home(&api, chip.params.as_deref(), true).await.unwrap();
+            println!("{} -> {} shelves: {}", chip.title, filtered.shelves.len(), titled(&filtered).join(" | "));
+        }
+        // The category list Explore is built from: a grid of buttons per section.
+        let v = api.call("browse", json!({ "browseId": "FEmusic_moods_and_genres" }), true).await.unwrap();
+        let sections = arr(&v["contents"]["singleColumnBrowseResultsRenderer"]["tabs"][0]["tabRenderer"]["content"]["sectionListRenderer"]["contents"]);
+        for s in sections {
+            let grid = &s["gridRenderer"];
+            let title = text(&grid["header"]["gridHeaderRenderer"]["title"]);
+            let items = arr(&grid["items"]);
+            println!("section {:?}: {} items", title, items.len());
+            for i in items.iter().take(4) {
+                let b = &i["musicNavigationButtonRenderer"];
+                let ep = &b["clickCommand"]["browseEndpoint"];
+                println!(
+                    "  {:?} browse {:?} params:{} stripe:{:?}",
+                    text(&b["buttonText"]),
+                    ep["browseId"].as_str(),
+                    ep["params"].as_str().is_some(),
+                    b["solid"]["leftStripeColor"].as_str()
+                );
+            }
+        }
+        // One category's shelves, the way a mood is opened for real.
+        let Some(first) = sections.iter().find_map(|s| arr(&s["gridRenderer"]["items"]).first().cloned()) else { return };
+        let ep = &first["musicNavigationButtonRenderer"]["clickCommand"]["browseEndpoint"];
+        let (Some(browse), params) = (ep["browseId"].as_str(), ep["params"].as_str()) else { return };
+        let v = api.call("browse", json!({ "browseId": browse, "params": params }), true).await.unwrap();
+        let sec = &v["contents"]["singleColumnBrowseResultsRenderer"]["tabs"][0]["tabRenderer"]["content"]["sectionListRenderer"];
+        let page = shelves(&sec["contents"]);
+        println!("{browse} {:?} -> {} shelves", text(&first["musicNavigationButtonRenderer"]["buttonText"]), page.len());
+        for s in page.iter().take(6) {
+            println!("  {}", titled(&HomePage { chips: vec![], shelves: vec![s.clone()], continuation: None }).join(" | "));
+        }
+    }
+
+    #[test]
+    fn release_shelves_point_at_their_whole_list() {
+        let discography = |browse: &str, params: &str| json!({
+            "browseId": browse, "params": params,
+            "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_ARTIST_DISCOGRAPHY"}}
+        });
+        let shelf = |title: &str, ep: Option<Value>| {
+            let run = if let Some(ep) = ep { json!({"text": title, "navigationEndpoint": {"browseEndpoint": ep}}) } else { json!({"text": title}) };
+            json!({"musicCarouselShelfRenderer": {"header": {"musicCarouselShelfBasicHeaderRenderer": {"title": {"runs": [run]}}}}})
+        };
+        // What an English artist page answers with, shelf for shelf: the release rows link
+        // to their whole lists, the rest either link somewhere else or not at all.
+        let sections = json!([
+            shelf("Albums", Some(discography("MPADUCx", "ggMIegYIARoCAQI%3D"))),
+            shelf("Singles & EPs", Some(discography("MPADUCx", "ggMIegYIAhoCAQI%3D"))),
+            shelf("Videos", Some(json!({"browseId": "VLy", "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_PLAYLIST"}}}))),
+            shelf("Featured on", None)
+        ]);
+        let v = json!({"contents": {"singleColumnBrowseResultsRenderer": {"tabs": [{"tabRenderer": {"content": {"sectionListRenderer": {"contents": sections}}}}]}}});
+        assert_eq!(
+            release_endpoints(&v),
+            [("MPADUCx".to_owned(), "ggMIegYIARoCAQI%3D".to_owned()), ("MPADUCx".to_owned(), "ggMIegYIAhoCAQI%3D".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_more_page_lists_its_releases_wherever_they_sit() {
+        let row = |title: &str, id: &str| json!({"musicResponsiveListItemRenderer": {
+            "flexColumns": [
+                {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": title}]}}},
+                {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Album • Ariana Grande"}]}}}
+            ],
+            "navigationEndpoint": {"browseEndpoint": {"browseId": id, "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_ALBUM"}}}}
+        }});
+        let v = json!({"contents": [{"sectionListRenderer": {"contents": [
+            {"musicResponsiveListRenderer": {"items": [row("Eternal Sunshine", "MPREb_a"), row("Positions", "MPREb_b")]}},
+            {"musicCarouselShelfRenderer": {"contents": [{"musicTwoRowItemRenderer": {
+                "title": {"runs": [{"text": "thank u, next"}]},
+                "subtitle": {"runs": [{"text": "Album • Ariana Grande"}]},
+                "navigationEndpoint": {"browseEndpoint": {"browseId": "MPREb_c", "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_ALBUM"}}}}
+            }}]}}
+        ]}}]});
+        let mut cards = Vec::new();
+        collect_cards(&v, &mut cards);
+        assert_eq!(cards.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(), ["Eternal Sunshine", "Positions", "thank u, next"]);
+    }
 }
-
-

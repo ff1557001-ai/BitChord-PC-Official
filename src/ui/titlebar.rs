@@ -47,8 +47,15 @@ pub fn buttons_rect(ctx: &egui::Context) -> Option<Rect> {
 
 /// The top margin above a row `row` tall at the top of the window: `normal`, or with the
 /// app's title bar what centres it on the window buttons' line.
+/// macOS keeps its own window buttons — the traffic lights — over the window's top left,
+/// and the app draws none of its own there. Every strip starts below them rather than
+/// under them.
+pub fn traffic_inset() -> f32 {
+    if cfg!(target_os = "macos") { 30.0 } else { 0.0 }
+}
+
 pub fn top_margin(normal: i8, row: f32) -> i8 {
-    if custom() { ((HEIGHT - row) / 2.0).round() as i8 } else { normal }
+    if custom() { ((HEIGHT - row) / 2.0).round() as i8 } else { normal + traffic_inset() as i8 }
 }
 
 /// How much of `row` (a strip along the top) the window buttons cover from its right.

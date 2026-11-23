@@ -113,16 +113,24 @@ impl BytesLoader for HttpImages {
                 backend.wake();
                 return;
             }
-            let res = async {
-                let resp = http.get(&uri).send().await?.error_for_status()?;
+            async fn get(http: &reqwest::Client, uri: &str) -> Result<(bytes::Bytes, Option<String>), reqwest::Error> {
+                let resp = http.get(uri).send().await?.error_for_status()?;
                 let mime = resp
                     .headers()
                     .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_owned);
-                Ok::<_, reqwest::Error>((resp.bytes().await?, mime))
+                Ok((resp.bytes().await?, mime))
             }
-            .await;
+            let res = match get(&http, &uri).await {
+                // An old or low-resolution upload has no `sddefault` or `maxresdefault`:
+                // YouTube answers 404 for them, so the copy every video has loads.
+                Err(e) if e.status() == Some(reqwest::StatusCode::NOT_FOUND) => match crate::model::thumbnail_fallback(&uri) {
+                    Some(alt) => get(&http, &alt).await,
+                    None => Err(e),
+                },
+                ok => ok,
+            };
             let entry = match res {
                 Ok((bytes, mime)) => {
                     if bytes.len() <= DISK_MAX_FILE {

@@ -592,6 +592,13 @@ fn local_tz() -> (String, i32) {
     (name, utc_offset_minutes())
 }
 
+/// The listener's own hour of the day, 0..24: what the time of day decides — the mood
+/// Home offers — is asked in their time, not the machine's raw clock.
+pub fn local_hour() -> usize {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    (((secs + utc_offset_minutes() as i64 * 60) / 3600) % 24).rem_euclid(24) as usize
+}
+
 #[cfg(windows)]
 fn utc_offset_minutes() -> i32 {
     #[repr(C)]

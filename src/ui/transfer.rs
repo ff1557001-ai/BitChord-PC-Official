@@ -363,7 +363,7 @@ fn setup(app: &mut App, ui: &mut Ui) {
                 _ if needs_sign_in => "Sign in to Spotify to copy your Liked Songs.".to_owned(),
                 Some(n) => {
                     let secs = (n as u64 / 20).max(5);
-                    format!("About {} to search {} songs. You can keep listening meanwhile.", fmt_secs(secs), fmt_n(n))
+                    format!("About {} to search {} songs. You can keep listening while it runs.", fmt_secs(secs), fmt_n(n))
                 }
                 None if chosen.is_some() => "You can keep listening while it runs.".to_owned(),
                 None => "Pick a playlist to copy.".to_owned(),
@@ -482,7 +482,7 @@ fn spotify_account_row(app: &mut App, ui: &mut Ui, account: &Account, compact: b
         }
     });
     if busy {
-        dim(ui, "Finish signing in in the window that opened.");
+        dim(ui, "Finish signing in through the window that opened.");
     }
     if sign_out {
         xfer.set_cookie(None, &app.backend);
@@ -610,7 +610,7 @@ fn running(app: &mut App, ui: &mut Ui, _now: f64) {
     let searched = job.searched();
     let (big, of, frac, eta) = match job.phase {
         Phase::Reading => (fmt_n(job.read.0), format!("of {} songs read from Spotify", fmt_n(job.read.1)), job.read.0 as f32 / job.read.1.max(1) as f32, None),
-        Phase::Saving if job.waiting => ("…".to_owned(), "waiting for the likes being changed in the app to finish".to_owned(), 0.0, None),
+        Phase::Saving if job.waiting => ("…".to_owned(), "waiting for the likes you're changing to finish".to_owned(), 0.0, None),
         Phase::Saving if let Some((done, of)) = job.redo => (
             fmt_n(done),
             format!("of {} songs liked again: YouTube Music dropped them", fmt_n(of)),
@@ -1417,9 +1417,44 @@ pub fn settings_section(app: &mut App, ui: &mut Ui) {
         open = pill(&mut child, "Open", None, true).clicked();
         super::pages::divider(ui);
         spotify_account_row(app, ui, &account, false);
+        super::pages::divider(ui);
+        token_login(app, ui, &account);
     });
     if open {
         app.actions.push(Action::Go(Page::Transfer));
+    }
+}
+
+/// Signing the Spotify side in by pasting an `sp_dc` cookie, for listeners who already
+/// have one and don't want a browser window opened. The box keeps it masked, and the
+/// string is dropped as soon as it's in the vault: the app never shows it back.
+fn token_login(app: &mut App, ui: &mut Ui, account: &Account) {
+    let note = match account {
+        Account::SignedIn { .. } => "Signed in with a saved cookie. Paste another to replace it.",
+        Account::Failed(_) => "The saved cookie wasn't accepted. Paste a fresh one.",
+        _ => "Or paste an sp_dc copied from your browser, and skip the sign-in window.",
+    };
+    if !super::pages::settings_row_shown(ui, "Spotify sp_dc cookie", note) {
+        return;
+    }
+    dim(ui, note);
+    ui.add_space(6.0);
+    super::dialogs::text_field(ui, "", &mut app.sp_token, false, true, "sp_dc");
+    ui.add_space(8.0);
+    let token = app.sp_token.trim();
+    // The key is often copied with its name in front of it.
+    let token = token.strip_prefix("sp_dc=").unwrap_or(token).to_owned();
+    let can_save = !token.is_empty();
+    let mut save = false;
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(can_save, |ui| {
+            save = pill(ui, "Save cookie", None, false).clicked();
+        });
+    });
+    if save {
+        // Out of memory as soon as it's saved; from here it lives only in the vault.
+        app.sp_token.clear();
+        app.transfer.clone().set_cookie(Some(token), &app.backend);
     }
 }
 

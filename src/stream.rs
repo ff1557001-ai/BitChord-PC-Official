@@ -26,7 +26,7 @@ const RETRIES: u32 = 6;
 const STALL: Duration = Duration::from_secs(20);
 /// googlevideo occasionally starts rejecting a URL partway through (HTTP 403);
 /// a freshly resolved URL for the same video resumes the download.
-const MAX_REFRESHES: u32 = 2;
+const MAX_REFRESHES: u32 = 6;
 /// A prefetch only fetches this much (~16 s of audio) until playback actually opens it:
 /// enough to start at once, without holding a whole extra song in memory.
 const HEAD_BLOCKS: usize = 2;
@@ -155,11 +155,6 @@ impl Shared {
     }
 
     /// A buffer that already holds the whole file (a downloaded song).
-    pub fn from_bytes(data: Vec<u8>, duration_ms: u64, loudness_db: Option<f32>) -> Arc<Self> {
-        // Saved songs are AAC (downloads take that stream).
-        Self::from_bytes_with_format(data, duration_ms, loudness_db, Format::Aac, None)
-    }
-
     /// A buffer that's already whole, in whatever container it was decoded to.
     pub fn from_bytes_with_format(data: Vec<u8>, duration_ms: u64, loudness_db: Option<f32>, format: Format, info: Option<crate::hires::Info>) -> Arc<Self> {
         let total = data.len() as u64;
@@ -342,10 +337,19 @@ pub async fn download(http: reqwest::Client, url: String, ua: String, shared: Ar
                             break;
                         }
                         Err(e) if is_forbidden(&e) && slot.renew(version).await => {}
-                        Err(e) if attempt < RETRIES && !is_forbidden(&e) => {
+                        Err(e) if attempt < RETRIES => {
                             attempt += 1;
-                            log::warn!("range {a}-{b}: {e:#} (retry {attempt})");
-                            tokio::time::sleep(Duration::from_millis(400 * (attempt * attempt) as u64)).await;
+                            let delay_ms = 400 * (attempt * attempt) as u64;
+                            if is_forbidden(&e) {
+                                // A URL that 403s partway through is refreshed and tried
+                                // again with a longer wait each time, rather than given up.
+                                log::warn!("range {a}-{b}: HTTP 403 Forbidden; retrying with backoff ({delay_ms} ms, attempt {attempt}/{RETRIES})");
+                                tokio::time::sleep(Duration::from_millis(delay_ms.max(800))).await;
+                                let _ = slot.renew(version).await;
+                            } else {
+                                log::warn!("range {a}-{b}: {e:#} (retry {attempt}/{RETRIES})");
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            }
                         }
                         Err(e) => {
                             shared.fail(format!("range {a}-{b}: {e:#}"));

@@ -20,17 +20,20 @@ pub fn process(bytes: &[u8]) -> anyhow::Result<Art> {
     let img = image::load_from_memory(bytes)?.to_rgb8();
     let small = image::imageops::resize(&img, SIZE, SIZE, image::imageops::FilterType::Triangle);
 
-    let accent = palette(&small);
+    let (accent, tint, share) = palette(&small);
     let mut px: Vec<[f32; 3]> = small.pixels().map(|p| [p[0] as f32, p[1] as f32, p[2] as f32]).collect();
 
-    // Kawarp's tint pass: pull near-black regions toward the accent so dark covers
-    // still produce a coloured backdrop instead of a black one.
-    let tint = [accent.r() as f32, accent.g() as f32, accent.b() as f32];
+    // Kawarp's tint pass: pull near-black regions toward the cover's own colour so dark
+    // sleeves still produce a coloured backdrop instead of a black one. How far it pulls
+    // follows how much of the sleeve actually carries that colour — a black cover with a
+    // red logo stays black, rather than washing the whole field red.
+    let tint = [tint[0], tint[1], tint[2]];
+    let strength = 0.45 * (share / 0.15).clamp(0.05, 1.0);
     for p in &mut px {
         let luma = (0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]) / 255.0;
         let dark = 1.0 - smoothstep(0.0, 0.5, luma);
         for c in 0..3 {
-            p[c] += (tint[c] - p[c]) * dark * 0.45;
+            p[c] += (tint[c] - p[c]) * dark * strength;
         }
     }
     // Three box-blur passes approximate a wide Gaussian (Kawarp runs 8 Kawase passes).
@@ -73,27 +76,64 @@ fn box_blur(src: &[[f32; 3]], n: usize, r: usize) -> Vec<[f32; 3]> {
     pass(&pass(src, true), false)
 }
 
-/// The most vivid colour (falling back to the average for greyscale covers).
-fn palette(img: &image::RgbImage) -> Color32 {
-    let (mut sum, mut n) = ([0.0f32; 3], 0.0f32);
-    let mut best = (0.0f32, [200.0, 60.0, 80.0]);
+/// The cover's colour: the hue its pixels actually cluster in, not its single most vivid
+/// point. Returns the accent for the UI, the same hue at the brightness the sleeve really
+/// has for the backdrop's tint, and the share of the sleeve that hue holds.
+fn palette(img: &image::RgbImage) -> (Color32, [f32; 3], f32) {
+    const B: usize = 8;
+    let mut bins = [[0.0f32; 4]; B * B * B];
+    let mut sum = [0.0f32; 3];
+    let mut n = 0.0f32;
+    let mut lit = 0.0f32;
     for p in img.pixels() {
-        let rgb = [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0];
+        let rgb = [p[0] as f32, p[1] as f32, p[2] as f32];
         for c in 0..3 {
             sum[c] += rgb[c];
         }
         n += 1.0;
         let (max, min) = (rgb[0].max(rgb[1]).max(rgb[2]), rgb[0].min(rgb[1]).min(rgb[2]));
-        let sat = if max > 0.0 { (max - min) / max } else { 0.0 };
-        // Favour saturated, mid-to-bright pixels.
-        let score = sat * sat * (1.0 - (max - 0.75).abs());
-        if score > best.0 {
-            best = (score, [rgb[0] * 255.0, rgb[1] * 255.0, rgb[2] * 255.0]);
+        // Near-black and grey pixels carry no hue worth following.
+        if max < 46.0 || max - min < 28.0 {
+            continue;
         }
+        lit += 1.0;
+        let i = (rgb[0] as usize * B / 256) * (B * B) + (rgb[1] as usize * B / 256) * B + (rgb[2] as usize * B / 256);
+        let b = &mut bins[i];
+        b[0] += rgb[0];
+        b[1] += rgb[1];
+        b[2] += rgb[2];
+        b[3] += 1.0;
     }
-    let avg = [sum[0] / n * 255.0, sum[1] / n * 255.0, sum[2] / n * 255.0];
-    let accent = if best.0 > 0.05 { best.1 } else { avg };
-    lift(accent)
+    let avg = [sum[0] / n, sum[1] / n, sum[2] / n];
+    let share = lit / n;
+    let Some(best) = bins
+        .iter()
+        .filter(|b| b[3] > 0.0)
+        .max_by(|a, b| score(a).partial_cmp(&score(b)).unwrap_or(std::cmp::Ordering::Equal))
+    else {
+        // Nothing coloured anywhere: a black-and-white sleeve keeps its own grey, so the
+        // backdrop stays monochrome instead of being tinted a colour it never had.
+        let g = ((avg[0] + avg[1] + avg[2]) / 3.0).clamp(28.0, 200.0);
+        return (Color32::from_rgb(g as u8, g as u8, g as u8), avg, 0.0);
+    };
+    let mean = [best[0] / best[3], best[1] / best[3], best[2] / best[3]];
+    // A hue only a sliver of the sleeve wears is a logo or a corner of the artwork, not
+    // the cover's colour: the mark may take it, the field drifts back to the average.
+    let strong = (share / 0.12).clamp(0.0, 1.0);
+    let tint = [
+        mean[0] * strong + avg[0] * (1.0 - strong),
+        mean[1] * strong + avg[1] * (1.0 - strong),
+        mean[2] * strong + avg[2] * (1.0 - strong),
+    ];
+    (lift(mean), tint, share)
+}
+
+/// What a colour bin is worth: how many pixels stand in it, and how coloured they are.
+fn score(b: &[f32; 4]) -> f32 {
+    let (r, g, bl) = (b[0] / b[3], b[1] / b[3], b[2] / b[3]);
+    let (max, min) = (r.max(g).max(bl), r.min(g).min(bl));
+    let sat = if max > 0.0 { (max - min) / max } else { 0.0 };
+    b[3] * (0.35 + sat)
 }
 
 /// Raise brightness so the colour reads on a dark UI.

@@ -11,7 +11,7 @@ use crate::backend::{Req, Resp};
 use crate::model::{ShelfKind, Track};
 use crate::ytm::HomePage;
 
-use super::{Action, App, Dialog, HomeState, LibTab, MixFrom, Page, PlayingAs, Repeat, dev_var, shuffle};
+use super::{Action, App, Dialog, HomeState, LibTab, MixFrom, Page, PlayingAs, Repeat, dev_var};
 
 impl App {
     pub(super) fn pump(&mut self, now: f64) {
@@ -191,8 +191,10 @@ impl App {
     fn on_resp(&mut self, r: Resp, now: f64) {
         match r {
             Resp::Home(page) => self.on_home(page),
-            Resp::HomeMore(page) => {
-                if let Some(h) = &mut self.home {
+            Resp::HomeMore { token, page } => {
+                if let Some(h) = &mut self.home
+                    && h.loading_more.as_ref().is_some_and(|(_, pending)| pending == &token)
+                {
                     h.shelves.extend(page.shelves);
                     h.continuation = page.continuation;
                     h.loading_more = None;
@@ -248,11 +250,11 @@ impl App {
                 }
                 let apple_key = format!("artist:{}", a.id);
                 let answered = self.apple_artists.get(&a.id).is_some_and(Option::is_some);
-                let cooling = self.apple_missed.get(&apple_key).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(120));
+                let cooling = self.apple.missed.get(&apple_key).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(120));
                 if !answered && !cooling {
                     let id = a.id.clone();
                     let name = a.name.clone();
-                    if self.apple_waiting.insert(apple_key) {
+                    if self.apple.waiting.insert(apple_key) {
                         self.backend.request(Req::AppleArtist { id, name });
                     }
                 }
@@ -287,14 +289,17 @@ impl App {
             Resp::Uploaded { done, failed } => {
                 let songs = |n: usize| if n == 1 { "1 song".to_owned() } else { format!("{n} songs") };
                 self.toast(match (done, failed.len()) {
-                    (_, 0) => format!("Uploaded {}. It can take a minute for YouTube Music to process them.", songs(done)),
+                    (_, 0) => format!("Uploaded {}. It can take a minute for YouTube Music to finish processing.", songs(done)),
                     (0, _) => format!("Upload failed: {}", failed.join(", ")),
                     _ => format!("Uploaded {}; failed: {}", songs(done), failed.join(", ")),
                 });
             }
-            Resp::Lyrics { video_id, lyrics } => {
-                if self.shown().is_some_and(|t| t.id == video_id) {
+            Resp::Lyrics { video_id, generation, lyrics, complete } => {
+                if lyrics_response_is_current(self.shown().map(|t| t.id.as_str()), self.lyrics_generation, &video_id, generation) {
                     let available = self.lyric_prefs.available(&lyrics);
+                    if !complete && available.is_empty() {
+                        return;
+                    }
                     let shown = self.lyric_prefs.choose(&video_id, &lyrics);
                     let missing: Vec<&str> = self.lyric_prefs.order.iter().filter(|(p, on)| *on && !available.contains(p)).map(|(p, _)| p.key()).collect();
                     log::info!(
@@ -306,6 +311,23 @@ impl App {
                         missing.join(", ")
                     );
                     self.lyrics = Some((video_id, lyrics));
+                    // The words are the fallback the best part falls back to, so an
+                    // answer about them can bring the button up on its own.
+                    self.update_best_part();
+                }
+            }
+            Resp::GeniusAbout { video_id, description } => {
+                if let Some(Dialog::GeniusAbout { track, description: result }) = &mut self.dialog
+                    && track.id == video_id
+                {
+                    *result = Some(description);
+                }
+            }
+            Resp::AppleAlbumAbout { id, description } => {
+                if let Some(Dialog::AppleAlbumAbout { id: shown, description: result, .. }) = &mut self.dialog
+                    && *shown == id
+                {
+                    *result = Some(description);
                 }
             }
             Resp::Segments { video_id, segments } => {
@@ -314,14 +336,30 @@ impl App {
                     self.segments = Some((video_id, segments));
                 }
             }
+            Resp::BestPart { video_id, heat } => {
+                self.curves_asked.remove(&video_id);
+                log::info!("best part: {} replay curve for {video_id}", if heat.is_some() { "a" } else { "no" });
+                self.curves.insert(video_id, heat);
+                self.update_best_part();
+            }
+            Resp::AiLabel { video_id, ai } => {
+                self.ai_flags.insert(video_id.clone(), ai);
+                // The answer can land mid-song: the skip is owed at once, not next time.
+                if ai && self.skip_ai && self.playing_id() == Some(video_id.as_str()) {
+                    self.toast("Skipped: YouTube labels this one made with AI.");
+                    self.next();
+                }
+            }
             Resp::LyricsExtras { video_id, source, target, extras } => {
                 if self.shown().is_some_and(|t| t.id == video_id) {
                     self.lyrics_extras = Some((video_id, source, target, extras));
                 }
             }
+            Resp::PageArt { key, art } => self.page_art = Some((key, art.rgba)),
             Resp::Art { key, art } => {
                 if self.mix_hold().is_none() && self.current_id() == Some(key.as_str()) {
                     self.accent = art.accent;
+                    self.frost_art = Some((key.clone(), art.rgba.clone()));
                     if let Some(bg) = &self.bg {
                         bg.set_art(art);
                     }
@@ -333,15 +371,15 @@ impl App {
                 // A miss is cooled down rather than cached for the session: Apple's
                 // search sometimes fails one time and answers the next.
                 let key = format!("artist:{id}");
-                self.apple_waiting.remove(&key);
+                self.apple.waiting.remove(&key);
                 match info {
                     Some(artwork) => {
-                        self.apple_missed.remove(&key);
+                        self.apple.missed.remove(&key);
                         self.apple_artists.insert(id, Some(artwork));
                     }
                     None => {
                         self.apple_artists.remove(&id);
-                        self.apple_missed.insert(key, std::time::Instant::now());
+                        self.apple.missed.insert(key, std::time::Instant::now());
                     }
                 }
             }
@@ -362,19 +400,106 @@ impl App {
                 self.hires_checks.insert(key, result);
             }
             Resp::AppleCover { key, motion } => {
-                self.apple_waiting.remove(&key);
+                self.apple.waiting.remove(&key);
                 match motion.and_then(|m| m.square) {
                     Some(url) => {
-                        self.apple_missed.remove(&key);
-                        self.apple_covers.insert(key, Some(url));
+                        self.apple.missed.remove(&key);
+                        self.apple.covers.insert(key, Some(url));
                     }
                     None => {
-                        self.apple_missed.insert(key, std::time::Instant::now());
+                        self.apple.missed.insert(key, std::time::Instant::now());
                     }
+                }
+            }
+            Resp::MusicVideo { key, video } => {
+                // Only the song the player is still on: an answer about one it skipped
+                // past is dropped, and the next try asks again.
+                if self.video.asked.as_deref() == Some(key.as_str()) {
+                    self.video.none = video.is_none();
+                    match video {
+                        Some(v) => self.video.stream = Some(v),
+                        // Nothing for this song, after both tries: say it, and let the
+                        // note time itself out rather than sit over the artwork.
+                        None => self.video.miss(),
+                    }
+                }
+            }
+            Resp::Canvas { key, canvas } => {
+                // Only the song the player is still on: an answer about one it has moved
+                // past leaves the next song's ask to make its own.
+                if self.canvas.asked.as_deref() == Some(key.as_str()) {
+                    self.canvas.url = canvas;
+                }
+            }
+            Resp::AppleFeed { path, shelves } => {
+                self.apple_feeds.remove(&path);
+                // An empty answer means Apple's page didn't load: keep nothing, so the
+                // YouTube feed carries the page and the next visit asks again.
+                if shelves.is_empty() {
+                    self.apple_shelves.remove(&path);
+                } else {
+                    self.apple_shelves.insert(path, shelves);
+                }
+                self.loading = false;
+            }
+            Resp::AppleCollection { url, collection } => {
+                self.apple_collection_waiting.remove(&url);
+                match collection {
+                    Some(c) => {
+                        self.apple_collections.insert(url, c);
+                    }
+                    None => {
+                        self.apple_collections.remove(&url);
+                    }
+                }
+                self.loading = false;
+            }
+            Resp::AppleOpened { apple, resolved } => {
+                let name = match &apple {
+                    crate::model::Target::Apple { title, .. } => title.clone(),
+                    _ => String::new(),
+                };
+                match resolved {
+                    Some(t) => self.actions.push(Action::Open(t)),
+                    None if name.is_empty() => {}
+                    None => self.toast(format!("YouTube Music has no copy of {name}.")),
+                }
+            }
+            Resp::Moods(moods) => {
+                self.moods_loading = false;
+                self.mood = super::pages::mood_for_hour(&moods);
+                self.moods = moods;
+            }
+            // A mood's own queue: what its playlists hold, shuffled, played from a
+            // random song rather than the first one YouTube put up.
+            Resp::MoodStation { name, tracks } => {
+                self.mood_loading = false;
+                let mut tracks = if self.play_songs { tracks.into_iter().filter(Track::is_song).collect() } else { tracks };
+                if self.skip_ai {
+                    tracks.retain(|t| !t.ai_labelled());
+                }
+                if tracks.is_empty() {
+                    self.toast(format!("{name} has nothing to play right now."));
+                } else {
+                    self.queue_source = None;
+                    let start = super::shuffled_start(tracks.len());
+                    self.play_list_filling(tracks, start, None, Some(true));
+                    self.toast(format!("Playing {name}"));
                 }
             }
             Resp::Radio { seed, tracks } => {
                 self.radio_pending = false;
+                // A radio offers suggestions, nothing the user clicked: with songs-only on its
+                // videos and podcast episodes step out. In a playlist the user played, a video
+                // stays, and its song copy is found when it comes to play.
+                let mut tracks = if self.play_songs { tracks.into_iter().filter(Track::is_song).collect() } else { tracks };
+                // The same for AI: a suggested song saying AI made it is enough to leave it out.
+                if self.skip_ai {
+                    tracks.retain(|t| !t.ai_labelled());
+                }
+                // The same seed comes back in the same order every time: mixing the
+                // suggestions means each listen is its own run, not a replay.
+                super::shuffle(&mut tracks);
                 let was_at_end = self.queue.add_radio(&seed, tracks);
                 if was_at_end && self.queue.index.is_some() && !self.buffering && !self.playing() {
                     // The track ended while radio was loading: continue now.
@@ -384,15 +509,14 @@ impl App {
                 }
             }
             // Unless something else was asked to play meanwhile; shuffled as last asked.
-            Resp::PlayQueue { target, mut tracks } => {
+            Resp::PlayQueue { target, tracks } => {
                 if let Some((p, shuffled)) = &self.play_pending
                     && *p == target
                 {
-                    if *shuffled {
-                        shuffle(&mut tracks);
-                    }
+                    let shuffled = *shuffled;
                     self.queue_source = Some(target);
-                    self.play_list(tracks, 0);
+                    let start = if shuffled { super::shuffled_start(tracks.len()) } else { 0 };
+                    self.play_list_filling(tracks, start, None, Some(shuffled));
                 }
             }
             Resp::Liked { video_id, like } => {
@@ -424,7 +548,7 @@ impl App {
                     self.toast("Waiting for the transfer to finish adding to Liked Music…");
                 } else if total > 1 && done < total {
                     let note = if self.backend.api().limited() { " (YouTube Music is limiting requests; waiting)" } else { "" };
-                    self.toast(format!("{} {done} of {total} songs…{note}", if like { "Liking" } else { "Removing likes:" }));
+                    self.toast(format!("{} {done} of {total} songs…{note}", if like { "Liking" } else { "Removing likes" }));
                 }
             }
             Resp::LikedMany { video_ids, failed, like } => self.on_liked_many(video_ids, failed, like),
@@ -563,9 +687,9 @@ impl App {
             self.request_liked(true);
         }
         let count = video_ids.len();
-        let mut msg = format!("{} {count} {}", if like { "Liked" } else { "Removed like from" }, if count == 1 { "song" } else { "songs" });
+        let mut msg = format!("{} {count} {}", if like { "Liked" } else { "Removed likes from" }, if count == 1 { "song" } else { "songs" });
         if count == 0 {
-            msg = format!("YouTube Music refused all {} songs; try again in a while", failed.len());
+            msg = format!("YouTube Music refused all {} songs; try again in a little while", failed.len());
         } else if !failed.is_empty() {
             msg += &format!("; YouTube Music refused {}", failed.len());
         }
@@ -692,12 +816,18 @@ impl App {
         self.loading = false;
         self.home_loading = false;
         self.radio_pending = false;
+        self.moods_loading = false;
+        self.mood_loading = false;
         if let Some(h) = &mut self.home {
             h.loading_more = None;
             h.picks_loading = false;
         }
         self.toast(e);
     }
+}
+
+fn lyrics_response_is_current(shown: Option<&str>, current_generation: u64, video_id: &str, generation: u64) -> bool {
+    shown == Some(video_id) && current_generation == generation
 }
 
 /// Unplayable songs skipped in a row before playback stops.
@@ -719,7 +849,15 @@ fn account_block(msg: &str, logged_in: bool) -> Option<&'static str> {
 
 #[cfg(test)]
 mod account_block_tests {
-    use super::account_block;
+    use super::{account_block, lyrics_response_is_current};
+
+    #[test]
+    fn lyrics_responses_require_the_current_song_and_request() {
+        assert!(lyrics_response_is_current(Some("song"), 2, "song", 2));
+        assert!(!lyrics_response_is_current(Some("song"), 2, "song", 1));
+        assert!(!lyrics_response_is_current(Some("other"), 2, "song", 2));
+        assert!(!lyrics_response_is_current(None, 2, "song", 2));
+    }
 
     #[test]
     fn account_errors_stop_instead_of_skipping() {

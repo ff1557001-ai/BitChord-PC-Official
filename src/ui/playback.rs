@@ -88,6 +88,12 @@ impl App {
         self.playing_track().map(|t| t.id.as_str())
     }
 
+    /// Whether YouTube's own description says AI made this song: the watch page's
+    /// "Made with AI" block, which a clean title and artist never repeat.
+    pub(super) fn ai_made(&self, id: &str) -> bool {
+        self.ai_flags.get(id).copied().unwrap_or(false)
+    }
+
     /// The outgoing song of an Automix handoff, while it is still the louder of the
     /// two: its tail keeps the player until the next song has taken over.
     pub(super) fn mix_hold(&self) -> Option<&MixFrom> {
@@ -163,12 +169,15 @@ impl App {
     }
 
     pub(super) fn play_list(&mut self, tracks: Vec<Track>, start: usize) {
-        self.play_list_filling(tracks, start, None);
+        self.play_list_filling(tracks, start, None, None);
     }
 
     /// `fill`: the queue is a playlist still coming in, and its other songs follow.
-    pub(super) fn play_list_filling(&mut self, tracks: Vec<Track>, start: usize, fill: Option<QueueFill>) {
-        if !self.queue.replace(tracks, start, fill) {
+    /// `shuffle`: what the queue's shuffle mark does for these songs — `None` keeps it as
+    /// it stands, so a song clicked mid-shuffle still plays from there and shuffles on.
+    pub(super) fn play_list_filling(&mut self, tracks: Vec<Track>, start: usize, fill: Option<QueueFill>, shuffle: Option<bool>) {
+        let shuffled = shuffle.unwrap_or(self.queue.shuffled);
+        if !self.queue.replace(tracks, start, fill, shuffled) {
             return;
         }
         // Whatever was about to play doesn't.
@@ -180,7 +189,7 @@ impl App {
     pub(super) fn restore_session(&mut self, json: &str) {
         let Ok(s) = serde_json::from_str::<Session>(json) else { return };
         let Some(track) = s.queue.get(s.index).cloned() else { return };
-        self.queue.adopt(s.queue, s.index);
+        self.queue.adopt(s.queue, s.index, s.shuffled, s.order);
         let shown = s.playing_as.clone().unwrap_or_else(|| track.clone());
         self.playing_as = s.playing_as.map(|song| PlayingAs { generation: self.generation, listed: track.id.clone(), song });
         let dur = shown.duration.map_or(s.duration_ms, |d| d as u64 * 1000);
@@ -189,7 +198,7 @@ impl App {
         self.resume_at = Some(Duration::from_millis(s.position_ms));
         self.listened_at = s.listened_at;
         self.request_art();
-        self.backend.request(Req::Lyrics(shown));
+        self.request_lyrics(shown);
     }
 
     /// Ask for the queue YouTube Music keeps across devices when the app starts and
@@ -219,7 +228,7 @@ impl App {
             return;
         }
         log::info!("picking up {} from another device ({} in its queue)", track.id, q.tracks.len());
-        self.queue.adopt(q.tracks, q.index);
+        self.queue.adopt(q.tracks, q.index, false, Vec::new());
         // Not a new play: an old song version mustn't come back with its video.
         self.playing_as = None;
         self.queue_source = None;
@@ -230,7 +239,7 @@ impl App {
         self.resume_at = Some(Duration::ZERO);
         self.resume_counts = true;
         self.request_art();
-        self.backend.request(Req::Lyrics(track.clone()));
+        self.refresh_lyrics(track.clone());
         self.toast(format!("Picked up \"{}\" from your other device. Press play to carry on.", track.title));
     }
 
@@ -243,6 +252,8 @@ impl App {
             duration_ms: self.audio.status.duration_ms.load(Ordering::Relaxed),
             listened_at: if self.playing() { unix_now() } else { self.listened_at },
             playing_as: self.playing_as().cloned(),
+            shuffled: self.queue.shuffled,
+            order: self.queue.list_order().to_vec(),
         })
         .ok()
     }
@@ -268,6 +279,21 @@ impl App {
     }
 
     pub(super) fn play_current(&mut self) {
+        // A song whose own name says AI made it doesn't play while that's switched off:
+        // on to the next the queue holds, and stop rather than run round the list.
+        if self.skip_ai {
+            let mut skipped = 0;
+            while self.current().is_some_and(|t| t.ai_labelled() || self.ai_made(&t.id)) {
+                if !self.queue.advance() || skipped + 1 >= self.queue.tracks.len() {
+                    self.toast("Everything left is labelled AI, so nothing plays.");
+                    return;
+                }
+                skipped += 1;
+            }
+            if skipped > 0 {
+                self.toast(format!("Skipped {skipped} song{} labelled AI.", if skipped == 1 { "" } else { "s" }));
+            }
+        }
         self.recoveries = 0;
         super::jam::hand_picked(self);
         self.play_current_at(Duration::ZERO, true);
@@ -298,8 +324,9 @@ impl App {
         let shown = carried.clone().unwrap_or_else(|| track.clone());
         self.audio.status.duration_ms.store(shown.duration.map_or(0, |d| d as u64 * 1000), Ordering::Relaxed);
         // A song running into the next crossfades (so does Next, when that's switched
-        // on); going back or picking a song cuts over.
-        self.audio.send(if self.handoff && at.is_zero() { AudioCmd::Handoff } else { AudioCmd::Stop });
+        // on); going back or picking a song cuts over. Bit-perfect output never mixes
+        // two songs, so even Next is a clean cut there.
+        self.audio.send(if self.handoff && at.is_zero() && !self.bit_perfect { AudioCmd::Handoff } else { AudioCmd::Stop });
         self.buffering = true;
         self.seek_drag = None;
         // A carried song version goes with its music video, which plays if the song won't.
@@ -312,6 +339,11 @@ impl App {
             self.show_in_media(&shown);
             // Background art follows the track; lyrics and segments, what plays.
             self.request_art();
+            // YouTube's own label is read off the video's description: a song whose
+            // name keeps it secret is still owed the skip once the answer lands.
+            if self.skip_ai {
+                self.backend.request(Req::AiCheck { video_id: shown.id.clone() });
+            }
             self.refresh_lyrics(shown);
         }
         if let Some(m) = &mut self.media {
@@ -334,15 +366,62 @@ impl App {
         }
     }
 
+    /// Lyrics for a song.
+    pub(super) fn request_lyrics(&mut self, track: Track) {
+        self.lyrics_generation += 1;
+        let genius_enabled = self.lyric_prefs.order.iter().any(|(p, enabled)| *p == crate::lyrics::Provider::GeniusPlain && *enabled);
+        self.backend.request(Req::Lyrics { track, generation: self.lyrics_generation, genius_enabled });
+    }
+
     /// Lyrics and SponsorBlock segments for `playing`, which timing is its own.
     pub(super) fn refresh_lyrics(&mut self, playing: Track) {
         self.lyrics = None;
         self.lyrics_extras = None;
         self.extras_asked = None;
         self.lyric_view.reset();
-        self.backend.request(Req::Lyrics(playing));
+        self.sidebar_lyric_view.reset();
+        self.request_lyrics(playing);
         self.segments = None;
         self.request_segments();
+        // A new song starts with its best part unreached and unheard: the button comes
+        // back for a song played again.
+        self.best_part = None;
+        self.best_part_heard = false;
+        self.request_best_part();
+        self.update_best_part();
+    }
+
+    /// Ask youtube.com where the playing song's best part is, when the button is on.
+    pub(super) fn request_best_part(&mut self) {
+        if !self.show_best_part {
+            return;
+        }
+        // What plays: a song version's curve is its own.
+        let Some(video_id) = self.playing_id().map(str::to_owned) else { return };
+        if self.curves.contains_key(&video_id) || !self.curves_asked.insert(video_id.clone()) {
+            return;
+        }
+        self.backend.request(Req::BestPart(video_id));
+    }
+
+    /// Where the playing song's best part starts: the bump in its replay curve where
+    /// youtube.com charts one, and the first chorus its synced words show otherwise.
+    /// Nothing while the curve is still on its way, since which of the two applies is
+    /// the curve's to say; the words are the fallback, not an addition to it.
+    pub(super) fn update_best_part(&mut self) {
+        let Some(id) = self.playing_id().map(str::to_owned) else { return };
+        // A late answer about the song before this one is dropped, as is an ask about a
+        // song the listener has already moved on from.
+        let Some(curve) = self.curves.get(&id) else { return };
+        let lines = self
+            .lyrics
+            .as_ref()
+            .filter(|(lyrics_id, _)| *lyrics_id == id)
+            .and_then(|(_, set)| set.sources.iter().find(|l| l.sync != crate::lyrics::Sync::None))
+            .map(|l| l.lines.as_slice())
+            .unwrap_or_default();
+        let duration_ms = self.playing_track().and_then(|t| t.duration).map_or(0, |d| d as i64 * 1000);
+        self.best_part = crate::bestpart::pick(curve.as_ref(), lines, duration_ms).map(|start| (id, start));
     }
 
     /// Keep the queue topped up so autoplay never stalls at the end; a playlist still
@@ -360,6 +439,16 @@ impl App {
         // Automix is a crossfade with its own shape, so it needs the length too.
         self.audio.set_automix(self.automix);
         self.audio.set_crossfade(if self.crossfade || self.automix { self.crossfade_secs } else { 0 });
+    }
+
+    /// The equalizer's settings, to the audio thread. Takes effect at once, gliding.
+    pub(crate) fn set_eq(&self) {
+        self.audio.set_eq(self.eq_on, &self.eq_gains, self.eq_no_clip);
+    }
+
+    /// How much of the centre vocal the engine takes out while singing along.
+    pub(crate) fn set_sing(&self) {
+        self.audio.set_vocal_cut(if self.sing { self.sing_level } else { 0.0 });
     }
 
     /// Ask SponsorBlock about the playing song, when that's switched on.
@@ -421,6 +510,10 @@ impl App {
             return self.toast("Only the host can change the party");
         }
         if !self.queue.advance() {
+            // The end of what's queued: with autoplay on the songs go on, so ask for
+            // more here too — an ask made when this song started may have failed or
+            // never been made at all, and playback would otherwise just park.
+            self.top_up();
             return;
         }
         self.play_current();
@@ -474,17 +567,51 @@ impl App {
             return;
         }
         let playing = self.playing();
+        // A bit-perfect track that ran out or lost its exclusive stream has nothing
+        // loaded to resume: start it again. A paused one keeps its DAC open.
+        if !playing
+            && !self.buffering
+            && self.bit_perfect
+            && self.audio.status.bit_perfect_current.load(Ordering::Relaxed)
+            && !self.audio.status.bit_perfect.load(Ordering::Relaxed)
+        {
+            self.play_current();
+            return;
+        }
         // The media controls catch up in `logic` once the player has switched.
         self.audio.send(if playing { AudioCmd::Pause } else { AudioCmd::Resume });
     }
 
-    pub(super) fn shuffle_upcoming(&mut self) {
+    /// The transport's shuffle mark: on plays what's still to come in a random order, off
+    /// hands the list's own order back.
+    pub(super) fn toggle_shuffle(&mut self) {
         if self.jam.locked() {
             return self.toast("Only the host can shuffle the party");
         }
-        if self.queue.shuffle_upcoming() {
-            self.toast("Shuffled up next");
-            self.prefetch_next();
+        let on = !self.queue.shuffled;
+        self.queue.set_shuffle(on);
+        self.toast(if on { "Shuffling up next" } else { "Playing in order" });
+        self.prefetch_next();
+    }
+
+    /// Switch lossless playback between the normal mixer and WASAPI exclusive output.
+    pub(super) fn set_bit_perfect(&mut self, on: bool) {
+        if self.bit_perfect == on {
+            return;
+        }
+        self.bit_perfect = on;
+        self.audio.send(AudioCmd::SetBitPerfect(on));
+        // Bit-perfect carries stereo PCM, so do not ask for an Atmos rendition while it
+        // is on. The listener's own Atmos choice comes back when it is switched off.
+        self.backend.set_prefer_atmos(self.prefer_atmos && !on);
+        self.toast(if on {
+            "Bit-perfect output on — lossless tracks go straight to the DAC"
+        } else {
+            "Bit-perfect output off"
+        });
+        if self.current().is_some() {
+            let at = self.audio.status.position();
+            self.play_current_at(at, false);
         }
     }
 }

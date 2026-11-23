@@ -206,10 +206,32 @@ pub fn icon_button(ui: &mut Ui, glyph: char, size: f32, name: &str, active: bool
 
 /// Rounded pill button. `primary` = white with dark text (YouTube Music's Play button).
 pub fn pill(ui: &mut Ui, label: &str, glyph: Option<char>, primary: bool) -> Response {
+    pill_h(ui, label, glyph, primary, 38.0)
+}
+
+/// The same pill at a chosen height: Apple's collection header plays its button larger
+/// than the 38 px one every other page uses, and everything in it scales with it.
+pub fn pill_h(ui: &mut Ui, label: &str, glyph: Option<char>, primary: bool, height: f32) -> Response {
+    pill_mark(ui, label, glyph.map(Mark::Char), primary, height)
+}
+
+/// The same pill marked with one of the app's Apple silhouettes.
+pub fn pill_h_apple(ui: &mut Ui, label: &str, glyph: Option<&'static [u8]>, primary: bool, height: f32) -> Response {
+    pill_mark(ui, label, glyph.map(Mark::Raster), primary, height)
+}
+
+/// A pill's leading mark: the icon font, or a silhouette from the app's own set.
+enum Mark {
+    Char(char),
+    Raster(&'static [u8]),
+}
+
+fn pill_mark(ui: &mut Ui, label: &str, mark: Option<Mark>, primary: bool, height: f32) -> Response {
+    let s = height / 38.0;
     // Laid out once; the colour is given when it's painted.
-    let text = ui.painter().layout_no_wrap(label.to_owned(), theme::semibold(14.0), Color32::PLACEHOLDER);
-    let icon_w = if glyph.is_some() { 24.0 } else { 0.0 };
-    let (rect, resp) = ui.allocate_exact_size(vec2(text.size().x + icon_w + 36.0, 38.0), Sense::click());
+    let text = ui.painter().layout_no_wrap(label.to_owned(), theme::semibold(14.0 * s), Color32::PLACEHOLDER);
+    let icon_w = if mark.is_some() { 24.0 * s } else { 0.0 };
+    let (rect, resp) = ui.allocate_exact_size(vec2(text.size().x + icon_w + 36.0 * s, height), Sense::click());
     let resp = named(resp, label).on_hover_cursor(egui::CursorIcon::PointingHand);
     let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered(), 0.15);
     let (fill, fg) = if primary {
@@ -218,10 +240,15 @@ pub fn pill(ui: &mut Ui, label: &str, glyph: Option<char>, primary: bool) -> Res
         (theme::glass(0.10 + 0.08 * h), theme::text())
     };
     let r = rect.shrink(if resp.is_pointer_button_down_on() { 1.0 } else { 0.0 });
-    ui.painter().rect_filled(r, 19.0, fill);
-    let mut x = r.left() + 18.0;
-    if let Some(g) = glyph {
-        icon_at(ui, pos2(x + 8.0, r.center().y), g, 17.0, fg);
+    ui.painter().rect_filled(r, height / 2.0, fill);
+    let mut x = r.left() + 18.0 * s;
+    if let Some(mark) = mark {
+        // Sized by ink, not by box: Apple's triangle fills more of its square than the
+        // font's does, so the two would not weigh the same at one number.
+        match mark {
+            Mark::Char(g) => icon_at(ui, pos2(x + 8.0 * s, r.center().y), g, 17.0 * s, fg),
+            Mark::Raster(g) => super::glyphs::draw(ui, pos2(x + 8.0 * s, r.center().y), super::glyphs::box_for(g, 13.5 * s), g, fg),
+        }
         x += icon_w;
     }
     ui.painter().galley(pos2(x, r.center().y - text.size().y / 2.0), text, fg);
@@ -267,9 +294,11 @@ fn fetch_px(px: u32) -> u32 {
 /// The cover URL to paint at `px`: that size once it has loaded, else the size shown
 /// last for the same cover. A cover that changes size (going full screen, resizing the
 /// window) keeps showing instead of blanking until the new size arrives, or for good
-/// if that download fails.
-fn steady_url(ctx: &egui::Context, base: &str, px: u32) -> String {
-    let want = sized(base, px);
+/// if that download fails. `square`: the slot is a square, so the picture is asked
+/// for cropped to one rather than fitted into the box.
+fn steady_url(ctx: &egui::Context, base: &str, px: u32, square: bool) -> String {
+    let size = |px: u32| if square { crate::model::sized_square(base, px) } else { sized(base, px) };
+    let want = size(px);
     let id = egui::Id::unique(("cover-shown", base));
     let ready = matches!(egui::Image::new(want.as_str()).load_for_size(ctx, Vec2::splat(px as f32)), Ok(egui::load::TexturePoll::Ready { .. }));
     if ready {
@@ -277,7 +306,7 @@ fn steady_url(ctx: &egui::Context, base: &str, px: u32) -> String {
         return want;
     }
     match ctx.data(|d| d.get_temp::<u32>(id)) {
-        Some(shown) if shown != px => sized(base, shown),
+        Some(shown) if shown != px => size(shown),
         _ => want,
     }
 }
@@ -314,7 +343,7 @@ pub fn paint_cover_xfade_px(ui: &Ui, site: egui::Id, rect: Rect, thumbs: &[Thumb
         let half = uv.size() / (2.0 * zoom);
         uv = Rect::from_center_size(c, half * 2.0);
     }
-    let url = steady_url(ui.ctx(), &t.url, px);
+    let url = steady_url(ui.ctx(), &t.url, px, true);
     cover_xfade(ui, site, rect, radius, &url, uv, Color32::WHITE);
 }
 
@@ -338,7 +367,7 @@ pub fn paint_cover_px(ui: &Ui, rect: Rect, thumbs: &[Thumb], radius: f32, zoom: 
         let half = uv.size() / (2.0 * zoom);
         uv = Rect::from_center_size(c, half * 2.0);
     }
-    let url = steady_url(ui.ctx(), &t.url, px);
+    let url = steady_url(ui.ctx(), &t.url, px, true);
     paint_remote(ui, &url, rect, radius, uv, Color32::WHITE);
 }
 
@@ -351,7 +380,7 @@ pub fn paint_cover_fill(ui: &Ui, rect: Rect, thumbs: &[Thumb], tint: Color32) {
     // Crop the square to the rect's aspect ratio, keeping the centre.
     let aspect = rect.width() / rect.height().max(1.0);
     let size = if aspect >= 1.0 { vec2(uv.width(), uv.height() / aspect) } else { vec2(uv.width() * aspect, uv.height()) };
-    let url = steady_url(ui.ctx(), &t.url, px);
+    let url = steady_url(ui.ctx(), &t.url, px, true);
     paint_remote(ui, &url, rect, 0.0, Rect::from_center_size(uv.center(), size), tint);
 }
 
@@ -359,7 +388,7 @@ pub fn paint_cover_fill(ui: &Ui, rect: Rect, thumbs: &[Thumb], tint: Color32) {
 pub fn preload_cover(ctx: &egui::Context, thumbs: &[Thumb], px: u32) {
     let px = fetch_px(px);
     if let Some(t) = pick_thumb(thumbs, px.min(544)) {
-        let _ = egui::Image::new(sized(&t.url, px)).load_for_size(ctx, Vec2::splat(px as f32));
+        let _ = egui::Image::new(crate::model::sized_square(&t.url, px)).load_for_size(ctx, Vec2::splat(px as f32));
     }
 }
 
@@ -371,7 +400,7 @@ pub fn paint_disc(ui: &Ui, site: egui::Id, center: Pos2, r: f32, thumbs: &[Thumb
     ui.painter().circle_filled(center, r, theme::glass(0.07));
     let px = fetch_px(px);
     let Some(t) = pick_thumb(thumbs, px.min(544)) else { return };
-    let url = steady_url(ui.ctx(), &t.url, px);
+    let url = steady_url(ui.ctx(), &t.url, px, true);
     let ready = matches!(egui::Image::new(&url).load_for_size(ui.ctx(), Vec2::splat(r * 2.0)), Ok(egui::load::TexturePoll::Ready { .. }));
     let uv = t.square_uv();
     dissolve(ui, site, &url, uv, ready, &mut |u, uv, a| {
@@ -473,20 +502,131 @@ fn cover_xfade(ui: &Ui, site: egui::Id, rect: Rect, radius: f32, url: &str, uv: 
     dissolve(ui, site, url, uv, ready, &mut |u, uv, a| paint_remote(ui, u, rect, radius, uv, tint.gamma_multiply(a)));
 }
 
+/// A tile's shape. Apple mixes these in one feed: square sleeves, 16:9 tiles for
+/// videos, and portrait tiles for singles.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Shape {
+    Square,
+    Wide,
+    Tall,
+    /// Apple's Home lead tile: a 4:3 portrait sleeve with its names sunk into the art,
+    /// so the tile is only the picture.
+    Poster,
+}
+
+impl Shape {
+    /// The artwork's height over its width.
+    pub fn aspect(self) -> f32 {
+        match self {
+            Shape::Square => 1.0,
+            Shape::Wide => 9.0 / 16.0,
+            Shape::Tall => 5.0 / 4.0,
+            Shape::Poster => 4.0 / 3.0,
+        }
+    }
+
+    /// The whole tile: the artwork plus the two lines of text under it, except for the
+    /// poster, whose text sits inside the art.
+    pub fn height(self, width: f32) -> f32 {
+        if self == Shape::Poster {
+            return width * self.aspect();
+        }
+        width * self.aspect() + 58.0
+    }
+
+    /// The narrowest Apple lets a tile of this shape get before the row stops dividing.
+    pub fn min_width(self) -> f32 {
+        match self {
+            Shape::Square => 144.0,
+            Shape::Wide => 270.0,
+            Shape::Tall => 132.0,
+            Shape::Poster => 200.0,
+        }
+    }
+
+    /// How many across the site fits at this viewport width, measured from its breakpoints.
+    pub fn columns(self, viewport: f32) -> usize {
+        let col = |small, mid, large| if viewport < 1260.0 { small } else if viewport < 1580.0 { mid } else { large };
+        match self {
+            Shape::Square => col(4, 5, 6),
+            Shape::Wide => col(2, 3, 4),
+            Shape::Tall => col(5, 6, 7),
+            Shape::Poster => col(3, 4, 5),
+        }
+    }
+}
+
+/// The picture inside a thumbnail: a 4:3 frame's letterboxing is trimmed, everything
+/// else is used whole.
+fn picture_uv(t: &Thumb) -> Rect {
+    let ratio = if t.height > 0 { t.width as f32 / t.height as f32 } else { 1.0 };
+    if ratio > 1.2 && ratio <= 1.6 {
+        Rect::from_min_max(pos2(0.0, 0.125), pos2(1.0, 0.875))
+    } else {
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0))
+    }
+}
+
+/// Paint a cover cropped to `rect`'s own aspect. A wide rect takes a video thumbnail's
+/// 16:9 picture whole; a portrait one centre-crops the square sleeve.
+pub fn paint_cover_crop(ui: &Ui, rect: Rect, thumbs: &[Thumb], radius: f32, zoom: f32) {
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let px = fetch_px((rect.width().max(rect.height()) * ui.ctx().pixels_per_point()) as u32);
+    ui.painter().rect_filled(rect, radius, theme::glass(0.07));
+    let Some(t) = pick_thumb(thumbs, px.min(544)) else {
+        icon_at(ui, rect.center(), icon::MUSIC, rect.width() * 0.3, theme::text_faint());
+        return;
+    };
+    let pic = picture_uv(t);
+    let src = (pic.width() * t.width as f32) / (pic.height() * t.height.max(1) as f32);
+    // The largest crop of the picture with the rect's aspect, kept centred on it.
+    let g = (rect.width() / rect.height().max(1.0)) / src;
+    let (mut w, mut h) = (pic.width(), pic.width() / g);
+    if h > pic.height() {
+        h = pic.height();
+        w = g * h;
+    }
+    let mut uv = Rect::from_center_size(pic.center(), vec2(w, h));
+    if zoom > 1.0 {
+        uv = Rect::from_center_size(uv.center(), uv.size() / zoom);
+    }
+    let url = steady_url(ui.ctx(), &t.url, px, false);
+    paint_remote(ui, &url, rect, radius, uv, Color32::WHITE);
+}
+
 /// Album/playlist/artist/song card with hover zoom, scrim and a play button.
 pub fn card(ui: &mut Ui, c: &Card, width: f32, liked: bool, acts: &mut Vec<Action>, sprite: Option<&MotionSprite>) {
-    let height = width + 58.0;
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+    card_shape(ui, c, width, Shape::Square, liked, acts, sprite);
+}
+
+/// [`card`] at a shape other than the square sleeve. Motion only plays on a square
+/// tile: a sleeve is cut from square art.
+pub fn card_shape(ui: &mut Ui, c: &Card, width: f32, shape: Shape, liked: bool, acts: &mut Vec<Action>, sprite: Option<&MotionSprite>) {
+    let art_h = width * shape.aspect();
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, shape.height(width)), Sense::click());
     if !ui.is_rect_visible(rect) {
         return;
     }
     let resp = named(resp, &c.title).on_hover_cursor(egui::CursorIcon::PointingHand);
     // contains_pointer, not hovered: the play button on top takes the hover, and the
     // card must stay "hovered" while the pointer is on it or the button would vanish.
-    let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.contains_pointer(), 0.22);
-    let img = Rect::from_min_size(rect.min, Vec2::splat(width));
-    let radius = if c.round { width / 2.0 } else { theme::card_radius().min(width / 2.0) };
-    paint_cover(ui, img, &c.thumbs, radius, 1.0 + 0.06 * h * theme::hover_k());
+    // Its own menu holding the tile open, the way the site keeps the mark lit while its
+    // menu is up.
+    let menu_up = egui::Popup::is_id_open(ui.ctx(), resp.id.with("more-hover").with("popup"));
+    let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.contains_pointer() || menu_up, 0.22);
+    let img = Rect::from_min_size(rect.min, vec2(width, art_h));
+    let radius = if c.round {
+        width / 2.0
+    } else {
+        theme::card_radius().min(art_h / 2.0).min(width / 2.0)
+    };
+    if shape == Shape::Square {
+        paint_cover(ui, img, &c.thumbs, radius, 1.0 + 0.06 * h * theme::hover_k());
+    } else {
+        paint_cover_crop(ui, img, &c.thumbs, radius, 1.0 + 0.06 * h * theme::hover_k());
+    }
     // The motion sleeve plays over the still, under the hover shade and play button.
     if let Some(s) = sprite {
         paint_motion(ui, img, radius, s);
@@ -498,30 +638,65 @@ pub fn card(ui: &mut Ui, c: &Card, width: f32, liked: bool, acts: &mut Vec<Actio
     // and shows pause.
     let active = active_state(ui, &c.target);
     let h = if active.is_some() { 1.0 } else { h };
+    // Apple measures both marks off the sleeve: 30 px discs 10 px in from its corners on a
+    // 144 px cover. A square tile gets play at the bottom-left and the options at the
+    // bottom-right; a poster keeps its name in that corner, so play moves to the right.
+    let disc = (width * 0.208).clamp(24.0, 34.0);
+    let inset = (width * 0.07).clamp(8.0, 14.0);
+    let rise = 6.0 * (1.0 - h);
+    let poster = shape == Shape::Poster;
+    let edge = inset + disc / 2.0;
+    let pc = if poster {
+        img.right_bottom() + vec2(-edge, -edge + rise)
+    } else {
+        img.left_bottom() + vec2(edge, -edge + rise)
+    };
     let mut play_hit = false;
+    let mut more: Option<Response> = None;
     if h > 0.01 {
-        let center = img.right_bottom() + vec2(-30.0, -30.0 + 8.0 * (1.0 - h));
-        let prect = Rect::from_center_size(center, Vec2::splat(44.0));
+        let prect = Rect::from_center_size(pc, Vec2::splat(disc + 4.0));
         let p = ui.interact(prect, resp.id.with("play"), Sense::click());
         let playing = active == Some(true);
         let p = named(p, &format!("{} {}", if playing { "Pause" } else { "Play" }, c.title)).on_hover_cursor(egui::CursorIcon::PointingHand);
         let ph = theme::anim_bool(ui.ctx(), p.id.with("h"), p.hovered(), 0.12);
-        ui.painter().circle_filled(center, 22.0 + 2.0 * ph, theme::shade(0.62 * h));
-        play_pause_glyph(ui, center, 10.0, theme::with_alpha(Color32::WHITE, h), playing);
+        ui.painter().circle_filled(pc, disc / 2.0 + 2.0 * ph, theme::shade(0.62 * h));
+        play_pause_glyph(ui, pc, disc * 0.23, theme::with_alpha(Color32::WHITE, h), playing);
         play_hit = p.clicked();
+        if !poster {
+            let mc = img.right_bottom() + vec2(-edge, -edge + rise);
+            let mrect = Rect::from_center_size(mc, Vec2::splat(disc + 4.0));
+            let m = ui.interact(mrect, resp.id.with("more-hover"), Sense::click());
+            let m = named(m, "Options").on_hover_cursor(egui::CursorIcon::PointingHand);
+            let mh = theme::anim_bool(ui.ctx(), m.id.with("h"), m.hovered(), 0.12);
+            ui.painter().circle_filled(mc, disc / 2.0, theme::shade(0.58 * h));
+            super::glyphs::draw(ui, mc, super::glyphs::box_for(super::glyphs::ELLIPSIS, disc * 0.3), super::glyphs::ELLIPSIS, theme::with_alpha(Color32::WHITE, h * (0.8 + 0.2 * mh)));
+            if m.clicked() {
+                more = Some(m);
+            }
+        }
     }
     let tcolor = theme::text();
-    let title = galley_wrapped(ui, &c.title, theme::semibold(14.5), tcolor, width, 2);
-    let title_h = title.size().y;
-    ui.painter().galley(pos2(rect.left(), img.bottom() + 10.0), title, tcolor);
-    let sub_y = img.bottom() + 14.0 + title_h;
-    linked_text(ui, pos2(rect.left(), sub_y), &c.subtitle, &c.links, theme::regular(13.0), theme::text_dim(), width - 36.0, acts);
-    // On the subtitle line, whose width leaves room for it, so a two-line title never sits under it.
-    let more_rect = Rect::from_center_size(pos2(rect.right() - 16.0, sub_y + 8.0), Vec2::splat(30.0));
-    let more = more_button(ui, more_rect, resp.id.with("more"), "Options");
-    egui::Popup::menu(&more).show(|ui| card_menu_contents(ui, c, liked, acts));
+    if shape == Shape::Poster {
+        // Apple's Home lead: its names sit inside the art over a scrim, the kind line
+        // above the title, and the options mark in the corner under the play button.
+        super::shell::vgradient(ui.painter(), Rect::from_min_max(pos2(img.left(), img.bottom() - 120.0), img.max), Color32::TRANSPARENT, theme::shade(0.78));
+        let title = galley_wrapped(ui, &c.title, theme::semibold(17.0), Color32::WHITE, width - 30.0, 2);
+        let th = title.size().y;
+        ui.painter().galley(pos2(img.left() + 15.0, img.bottom() - 19.0 - th), title, Color32::WHITE);
+        ui.painter().text(pos2(img.left() + 15.0, img.bottom() - 24.0 - th), Align2::LEFT_BOTTOM, &c.subtitle, theme::regular(13.0), theme::with_alpha(Color32::WHITE, 0.82));
+    } else {
+        let title = galley_wrapped(ui, &c.title, theme::semibold(14.5), tcolor, width, 2);
+        let title_h = title.size().y;
+        ui.painter().galley(pos2(rect.left(), img.bottom() + 10.0), title, tcolor);
+        let sub_y = img.bottom() + 14.0 + title_h;
+        linked_text(ui, pos2(rect.left(), sub_y), &c.subtitle, &c.links, theme::regular(13.0), theme::text_dim(), width, acts);
+    }
+    // The site carries no options mark in the caption: the one over the artwork is the menu.
+    if let Some(ref m) = more {
+        menu_popup(egui::Popup::menu(m), MENU_W, |ui| card_menu_contents(ui, c, liked, acts));
+    }
     // Right-click anywhere on the tile opens the same menu.
-    egui::Popup::context_menu(&resp).show(|ui| card_menu_contents(ui, c, liked, acts));
+    menu_popup(egui::Popup::context_menu(&resp), MENU_W, |ui| card_menu_contents(ui, c, liked, acts));
 
     if play_hit {
         match &c.target {
@@ -529,7 +704,7 @@ pub fn card(ui: &mut Ui, c: &Card, width: f32, liked: bool, acts: &mut Vec<Actio
             Target::Song(t) => acts.push(Action::Radio(t.clone())),
             t => acts.push(Action::PlayCollection(t.clone(), false)),
         }
-    } else if resp.clicked() && !more.clicked() {
+    } else if resp.clicked() && more.is_none() {
         acts.push(Action::Open(c.target.clone()));
     }
 }
@@ -538,7 +713,7 @@ pub(crate) fn card_menu_contents(ui: &mut Ui, c: &Card, liked: bool, acts: &mut 
     match &c.target {
         Target::Song(t) => song_menu(ui, t, liked, None, None, acts),
         t => {
-            ui.set_width(226.0);
+            ui.set_width(MENU_W);
             ui.add_space(3.0);
             if menu_action(ui, Some(icon::PLAY), "Play") {
                 acts.push(Action::PlayCollection(t.clone(), false));
@@ -558,14 +733,14 @@ pub(crate) fn card_menu_contents(ui: &mut Ui, c: &Card, liked: bool, acts: &mut 
     }
 }
 
-fn more_button(ui: &mut Ui, rect: Rect, id: egui::Id, label: &str) -> Response {
+pub fn more_button(ui: &mut Ui, rect: Rect, id: egui::Id, label: &str) -> Response {
     let response = named(ui.interact(rect, id, Sense::click()), label)
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     if response.hovered() || egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response)) {
         ui.painter().rect_filled(rect, 7.0, theme::glass(0.16));
     }
     let color = if response.hovered() { theme::text() } else { theme::text_dim() };
-    icon_at(ui, rect.center(), icon::ELLIPSIS_VERTICAL, 18.0, color);
+    super::glyphs::draw(ui, rect.center(), super::glyphs::box_for(super::glyphs::ELLIPSIS, 13.0), super::glyphs::ELLIPSIS, color);
     response
 }
 
@@ -592,26 +767,121 @@ pub fn menu_action(ui: &mut Ui, glyph: Option<char>, label: &str) -> bool {
 }
 
 /// A menu row marked with the app's own star, filled once the song is liked.
-fn menu_action_star(ui: &mut Ui, liked: bool, label: &str) -> bool {
+pub fn menu_action_star(ui: &mut Ui, liked: bool, label: &str) -> bool {
     menu_row(ui, label, |ui, at, color| {
         let glyph = if liked { super::glyphs::STAR_FILLED } else { super::glyphs::STAR };
         super::glyphs::draw(ui, at, 16.0, glyph, color);
     })
 }
 
-/// `remove`: the song's row in the open playlist, when it's yours and the song can come out.
-pub fn song_menu(ui: &mut Ui, t: &Track, liked: bool, remove: Option<usize>, queue_move: Option<(usize, bool, bool)>, acts: &mut Vec<Action>) {
-    ui.set_width(226.0);
-    ui.add_space(3.0);
-    song_actions(ui, t, liked, remove, true, acts);
-    ui.separator();
-    if menu_action(ui, Some(icon::LIST_PLUS), "Play next") {
-        acts.push(Action::PlayNext(t.clone()));
+/// A menu row marked with one of Apple's own silhouettes rather than the Lucide pen.
+pub fn menu_action_apple(ui: &mut Ui, glyph: &'static [u8], label: &str) -> bool {
+    menu_row(ui, label, |ui, at, color| super::glyphs::draw(ui, at, 16.0, glyph, color))
+}
+
+/// A menu row marked with Apple's share mark. The silhouette set has no share glyph, so
+/// this one is drawn: an open-topped tray with an arrow lifting out of it.
+pub fn menu_action_share(ui: &mut Ui, label: &str) -> bool {
+    menu_row(ui, label, |ui, at, color| share_mark(ui, at, color))
+}
+
+/// A menu row marked with the info circle Apple puts on a song's details.
+pub fn menu_action_info(ui: &mut Ui, label: &str) -> bool {
+    menu_row(ui, label, |ui, at, color| {
+        ui.painter().circle_stroke(at, 7.0, egui::Stroke::new(1.5, color));
+        ui.painter().text(at, Align2::CENTER_CENTER, "i", theme::semibold(10.0), color);
+    })
+}
+
+/// Apple's `square.and.arrow.up` at `at`: a closed tray with the arrow lifting out of its
+/// top wall. The wall stays drawn — the arrow crosses it, it is not an opening — because
+/// the mark Apple puts on a share is a box, not a basket.
+fn share_mark(ui: &Ui, at: Pos2, color: Color32) {
+    let pen = egui::Stroke::new(1.5, color);
+    let tray = Rect::from_center_size(at + vec2(0.0, 2.5), vec2(13.0, 11.0));
+    ui.painter().rect_stroke(tray, 2.5, pen, egui::StrokeKind::Middle);
+    // The arrow, its stem through the tray's top edge and its head above it.
+    let tip = pos2(at.x, at.y - 7.0);
+    ui.painter().line_segment([tip, pos2(at.x, at.y + 1.0)], pen);
+    ui.painter().line_segment([tip, pos2(at.x - 3.2, tip.y + 3.4)], pen);
+    ui.painter().line_segment([tip, pos2(at.x + 3.2, tip.y + 3.4)], pen);
+}
+
+/// Apple Music's `arrow.down.circle` at `at`: the ring a song comes down through and the
+/// arrow inside it. The set's own download mark is the tray-and-arrow the sidebar's
+/// "Downloaded" page wears; a list row's download is the circle.
+fn download_mark(ui: &Ui, at: Pos2, color: Color32) {
+    let pen = egui::Stroke::new(1.5, color);
+    let (ring, stem, head) = (7.0, 4.4, 2.6);
+    ui.painter().circle_stroke(at, ring, pen);
+    ui.painter().line_segment([pos2(at.x, at.y - stem), pos2(at.x, at.y + stem)], pen);
+    for s in [-1.0, 1.0] {
+        ui.painter().line_segment([pos2(at.x, at.y + stem), pos2(at.x + s * head, at.y + stem - head)], pen);
     }
-    if menu_action(ui, Some(icon::LIST_MUSIC), "Add to queue") {
+}
+
+/// A menu row marked with the download circle.
+pub fn menu_action_download(ui: &mut Ui, label: &str) -> bool {
+    menu_row(ui, label, |ui, at, color| download_mark(ui, at, color))
+}
+
+/// The width every ⋯ menu lays its rows out at.
+pub const MENU_W: f32 = 226.0;
+
+/// Shows a ⋯ menu where the window can actually hold it.
+///
+/// egui chooses a popup's side from the size it remembered on the frame before, and on the frame
+/// it opens it remembers nothing, so the menu drops from the button whichever way that points and
+/// the rows past the window edge are drawn off-screen — out of reach of the pointer, not just out
+/// of sight. The long song menu is taller than the mini player's whole card, so there it can
+/// never fit either way. So: drop down while a full menu still fits below, otherwise take the
+/// roomier half, hold egui to that choice, and scroll the rows into the room it leaves.
+pub fn menu_popup(popup: egui::Popup<'_>, width: f32, add: impl FnOnce(&mut Ui)) {
+    // Twelve rows of 34 plus the menu's own padding: what the song menu wants.
+    const NEEDED: f32 = 430.0;
+    let ctx = popup.ctx();
+    let area = ctx.content_rect();
+    // A context menu remembers the pointer only once egui has shown it, so on the frame it opens
+    // there is nothing to ask: use the pointer itself, which is where it is going to appear.
+    let anchor = popup
+        .get_anchor_rect()
+        .or_else(|| ctx.pointer_hover_pos().map(Rect::from_pos))
+        .unwrap_or(area);
+    let (below, above) = (area.bottom() - anchor.bottom(), anchor.top() - area.top());
+    let down = below >= NEEDED || below >= above;
+    // Right-aligned when a menu of `width` hung off the button would leave the window.
+    let end = anchor.left() + width + 12.0 > area.right();
+    let (align, room) = match (down, end) {
+        (true, false) => (egui::RectAlign::BOTTOM_START, below),
+        (true, true) => (egui::RectAlign::BOTTOM_END, below),
+        (false, false) => (egui::RectAlign::TOP_START, above),
+        (false, true) => (egui::RectAlign::TOP_END, above),
+    };
+    popup.align(align).align_alternatives(&[]).show(|ui| {
+        // The popup's own frame padding: the rows have to fit inside it, not just in the window.
+        let pad = egui::Frame::popup(ui.style()).total_margin().sum().y;
+        let max_h = (room - pad - 6.0).max(96.0);
+        egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| add(ui));
+    });
+}
+
+pub fn song_menu(ui: &mut Ui, t: &Track, liked: bool, remove: Option<&(String, Option<String>)>, queue_move: Option<(usize, bool, bool)>, acts: &mut Vec<Action>) {
+    ui.set_width(MENU_W);
+    ui.add_space(3.0);
+    song_actions(ui, t, liked, remove, true, true, acts);
+    // Putting a song in the queue is a section of its own: a move rather than something
+    // done to the song itself, and the queue's own rows sit with it.
+    ui.separator();
+    // A row already in the queue plays next by moving that row; one from elsewhere is
+    // put in after the song playing.
+    if menu_action(ui, Some(icon::LIST_PLUS), "Play next") {
+        acts.push(queue_move.map_or_else(|| Action::PlayNext(t.clone()), |(i, _, _)| Action::QueuePlayNext(i)));
+    }
+    if menu_action_apple(ui, super::glyphs::QUEUE, "Add to queue") {
         acts.push(Action::Enqueue(t.clone()));
     }
-    if menu_action(ui, Some(icon::LIST_MUSIC), "View queue") {
+    ui.separator();
+    if menu_action_apple(ui, super::glyphs::QUEUE, "View queue") {
         acts.push(Action::ViewQueue);
     }
     if let Some((i, up, down)) = queue_move {
@@ -622,8 +892,12 @@ pub fn song_menu(ui: &mut Ui, t: &Track, liked: bool, remove: Option<usize>, que
             acts.push(Action::QueueMove(i, 1));
         }
     }
-    if menu_action(ui, Some(icon::RADIO), "Start radio") {
+    if menu_action_apple(ui, super::glyphs::RADIO, "Start radio") {
         acts.push(Action::Radio(t.clone()));
+    }
+    ui.separator();
+    if menu_action_share(ui, "Share song") {
+        acts.push(Action::Share(Target::Song(t.clone())));
     }
     ui.add_space(3.0);
 }
@@ -631,23 +905,23 @@ pub fn song_menu(ui: &mut Ui, t: &Track, liked: bool, remove: Option<usize>, que
 /// The song menu's items, for menus that add their own (now playing's options).
 /// `like`: whether this menu may change the song's like. The app's row menus do; the
 /// player's own ⋯ leaves it to them, so the two menus aren't the same list twice.
-pub fn song_actions(ui: &mut Ui, t: &Track, liked: bool, remove: Option<usize>, like: bool, acts: &mut Vec<Action>) {
+/// `about`: whether the menu carries the song's info. Only the row menus, where there is
+/// no title to click; the player opens it by clicking the name.
+pub fn song_actions(ui: &mut Ui, t: &Track, liked: bool, remove: Option<&(String, Option<String>)>, like: bool, _about: bool, acts: &mut Vec<Action>) {
     if like {
         if menu_action_star(ui, liked, if liked { "Remove like" } else { "Like song" }) {
             acts.push(Action::Like(t.clone(), !liked));
         }
-        if menu_action(ui, Some(icon::THUMBS_DOWN), "Dislike") {
-            acts.push(Action::Dislike(t.clone()));
-        }
         ui.separator();
     }
-    if menu_action(ui, Some(icon::LIST_PLUS), "Add to playlist") {
+    if menu_action_apple(ui, super::glyphs::PLAYLIST, "Add to playlist") {
         acts.push(Action::AddToPlaylist(vec![t.clone()]));
     }
-    if let Some(i) = remove
+    if let Some((playlist, set_id)) = remove
         && menu_action(ui, Some(icon::LIST_MINUS), "Remove from playlist")
     {
-        acts.push(Action::RemoveFromPlaylist(vec![i]));
+        let items = set_id.iter().map(|set| (t.id.clone(), set.clone())).collect();
+        acts.push(Action::RemoveFromPlaylist { playlist: playlist.clone(), items });
     }
     match crate::downloads::path(&t.id) {
         Some(path) => {
@@ -656,7 +930,7 @@ pub fn song_actions(ui: &mut Ui, t: &Track, liked: bool, remove: Option<usize>, 
             }
         }
         None => {
-            if menu_action(ui, Some(icon::DOWNLOAD), "Download") {
+            if menu_action_download(ui, "Download") {
                 acts.push(Action::Download(t.clone()));
             }
         }
@@ -782,12 +1056,18 @@ pub struct RowOpts {
     pub pick: bool,
     /// Selecting songs: a checkbox leads the row; `Some(true)` when this one is picked.
     pub selected: Option<bool>,
-    /// The row's index in your own open playlist, so its menu can take it out.
-    pub remove: Option<usize>,
+    /// The playlist and entry identity, when this song can be removed.
+    pub remove: Option<(String, Option<String>)>,
     /// A queue row: its index, so hovering swaps the duration for a remove button.
     pub queue_remove: Option<usize>,
     /// A queue row that may be reordered: its index and whether it can move up and down.
     pub queue_move: Option<(usize, bool, bool)>,
+    /// A playlist row: Apple puts the artists in the column beside the title rather than
+    /// under it, so the title stands on its own line.
+    pub artist_col: bool,
+    /// An artist page's top-song row: the release rides under the title and the row keeps
+    /// no columns of its own.
+    pub sub_album: bool,
 }
 
 const ROW_H: f32 = 56.0;
@@ -795,8 +1075,13 @@ const ROW_H: f32 = 56.0;
 /// A long list of song rows: only the ones on screen are built; the rest is empty space
 /// of the same height. `row(ui, i)` draws row `i`, under an id of its own so its hover
 /// and menu state don't jump to another song as the list scrolls.
-pub fn visible_rows(ui: &mut Ui, n: usize, mut row: impl FnMut(&mut Ui, usize)) {
-    let h = ROW_H + ui.spacing().item_spacing.y;
+pub fn visible_rows(ui: &mut Ui, n: usize, row: impl FnMut(&mut Ui, usize)) {
+    visible_rows_with(ui, n, ROW_H, row)
+}
+
+/// `visible_rows` for a surface whose rows are a different height (the queue's).
+pub fn visible_rows_with(ui: &mut Ui, n: usize, row_h: f32, mut row: impl FnMut(&mut Ui, usize)) {
+    let h = row_h + ui.spacing().item_spacing.y;
     let top = ui.cursor().top();
     let clip = ui.clip_rect();
     let first = (((clip.top() - top) / h).floor().max(0.0) as usize).min(n);
@@ -874,21 +1159,35 @@ pub fn track_row(ui: &mut Ui, t: &Track, o: &RowOpts, acts: &mut Vec<Action>) ->
     let avail = right - dur_w - x;
     let wide = avail > 520.0;
     // Album rows (numbered) are just song name and plays; other rows are
-    // title + artists, then album, then plays when there's room.
-    let album_row = o.number.is_some();
-    let (title_w, plays_x, album_x) = match (wide, o.show_album, t.plays) {
-        (true, true, Some(_)) => (avail * 0.45, Some(x + avail * 0.82), Some(x + avail * 0.5)),
-        (true, true, None) => (avail * 0.55, None, Some(x + avail * 0.6)),
-        (true, false, Some(_)) => (avail * 0.78, Some(x + avail * 0.82), None),
+    // title + artists, then album, then plays when there's room. A playlist row swaps
+    // the artists into that column and leaves the title alone; an artist page's top
+    // song puts the release under the title and keeps no column beside it.
+    let plays = if o.artist_col || o.sub_album {
+        None
+    } else {
+        t.plays.map(|n| format!("{} plays", crate::backend::compact(n)))
+    };
+    let mid = wide && !o.sub_album && (o.show_album || o.artist_col);
+    let (title_w, plays_x, album_x) = match (mid, o.artist_col, &plays) {
+        (true, true, _) => (avail * 0.45, None, Some(x + avail * 0.5)),
+        (true, false, Some(_)) => (avail * 0.45, Some(x + avail * 0.82), Some(x + avail * 0.5)),
+        (true, false, None) => (avail * 0.55, None, Some(x + avail * 0.6)),
+        (false, false, Some(_)) => (avail * 0.78, Some(x + avail * 0.82), None),
         _ => (avail, None, None),
     };
-    let plays = t.plays.map(|n| format!("{} plays", crate::backend::compact(n)));
+    let album_row = o.number.is_some();
     let title_col = if o.current { o.accent } else { theme::text() };
-    let sub = match (album_row, &plays, plays_x) {
-        (true, Some(p), None) => Some(p.clone()),
-        (true, _, _) => None,
-        (false, Some(p), None) => Some(format!("{} \u{2022} {p}", t.artist_line())),
-        (false, _, _) => Some(t.artist_line()),
+    let sub = if o.artist_col {
+        None
+    } else if o.sub_album {
+        t.album.as_ref().map(|a| a.name.clone())
+    } else if album_row {
+        plays_x.is_none().then(|| plays.clone()).flatten()
+    } else {
+        match (&plays, plays_x) {
+            (Some(p), None) => Some(format!("{} \u{2022} {p}", t.artist_line())),
+            _ => Some(t.artist_line()),
+        }
     };
     let sub = match (sub, &o.added_by) {
         (Some(s), Some(by)) if !s.is_empty() => Some(format!("{s} \u{2022} Added by {by}")),
@@ -898,53 +1197,55 @@ pub fn track_row(ui: &mut Ui, t: &Track, o: &RowOpts, acts: &mut Vec<Action>) ->
     let title_y = if sub.is_some() { cy - 18.0 } else { cy - 9.0 };
     text_at(ui, pos2(x, title_y), &t.title, theme::semibold(14.5), title_col, title_w);
     if let Some(sub) = &sub {
-        linked_text(ui, pos2(x, cy + 2.0), sub, &t.artists, theme::regular(13.0), theme::text_dim(), title_w, acts);
+        // An artist page's row links the release under its title; every other row links
+        // the artists the line names.
+        let link = o.sub_album.then(|| t.album.as_ref()).flatten().map(|a| Link { name: a.name.clone(), id: a.id.clone() });
+        match &link {
+            Some(l) => linked_text(ui, pos2(x, cy + 2.0), sub, std::slice::from_ref(l), theme::regular(13.0), theme::text_dim(), title_w, acts),
+            None => linked_text(ui, pos2(x, cy + 2.0), sub, &t.artists, theme::regular(13.0), theme::text_dim(), title_w, acts),
+        };
     }
-    if let (Some(px), Some(p)) = (plays_x, &plays) {
+    if let Some(px) = plays_x
+        && let Some(p) = &plays
+    {
         ui.painter().text(pos2(px, cy), Align2::LEFT_CENTER, p, theme::regular(13.5), theme::text_dim());
     }
-    if let (Some(ax), Some(album)) = (album_x, &t.album) {
-        let w = plays_x.unwrap_or(right - dur_w) - ax - 10.0;
-        let g = galley(ui, &album.name, theme::regular(13.5), theme::text_dim(), w);
-        let ar = Rect::from_min_size(pos2(ax, cy - 9.0), g.size());
-        ui.painter().galley(ar.min, g, theme::text_dim());
-        // Album name opens the album, like the artist names.
-        if let Some(id) = &album.id {
-            let r = named(ui.interact(ar, resp.id.with("album"), Sense::click()), &album.name);
-            let r = r.on_hover_cursor(egui::CursorIcon::PointingHand);
-            if r.hovered() {
-                ui.painter().hline(ar.x_range(), ar.bottom() - 1.0, egui::Stroke::new(1.0, theme::text_dim()));
-            }
-            if r.clicked() {
-                acts.push(Action::Open(Target::Album(id.clone())));
+    if let Some(ax) = album_x {
+        // The playlist row's column names the artists; everyone else's names the release.
+        if o.artist_col {
+            let w = right - ax - 10.0;
+            linked_text(ui, pos2(ax, cy - 9.0), &t.artist_line(), &t.artists, theme::regular(13.5), theme::text_dim(), w, acts);
+        } else if let Some(album) = &t.album {
+            let w = plays_x.unwrap_or(right - dur_w) - ax - 10.0;
+            let g = galley(ui, &album.name, theme::regular(13.5), theme::text_dim(), w);
+            let ar = Rect::from_min_size(pos2(ax, cy - 9.0), g.size());
+            ui.painter().galley(ar.min, g, theme::text_dim());
+            // Album name opens the album, like the artist names.
+            if let Some(id) = &album.id {
+                let r = named(ui.interact(ar, resp.id.with("album"), Sense::click()), &album.name);
+                let r = r.on_hover_cursor(egui::CursorIcon::PointingHand);
+                if r.hovered() {
+                    ui.painter().hline(ar.x_range(), ar.bottom() - 1.0, egui::Stroke::new(1.0, theme::text_dim()));
+                }
+                if r.clicked() {
+                    acts.push(Action::Open(Target::Album(id.clone())));
+                }
             }
         }
     }
     let more_rect = Rect::from_center_size(pos2(rect.right() - 20.0, cy), Vec2::splat(30.0));
     let more = more_button(ui, more_rect, base.id.with("more"), "Song options");
-    // A queue row gives the duration's slot to a remove button while the pointer is
-    // anywhere left of the ⋯, so the two controls never land on each other.
-    let queue = o.queue_remove.filter(|_| ui.rect_contains_pointer(Rect::from_min_max(rect.min, pos2(more_rect.left(), rect.bottom()))));
-    if let Some(d) = t.duration.filter(|_| queue.is_none()) {
+    if let Some(d) = t.duration {
         ui.painter().text(pos2(right, cy), Align2::RIGHT_CENTER, super::fmt_time(d), theme::regular(13.0), theme::text_dim());
     }
-    if let Some(i) = queue {
-        let slot = Rect::from_center_size(pos2(right - dur_w / 2.0, cy), Vec2::splat(28.0));
-        let xr = named(ui.interact(slot, base.id.with("rm"), Sense::click()), "Remove from queue").on_hover_cursor(egui::CursorIcon::PointingHand);
-        ui.painter().circle_filled(slot.center(), 14.0, theme::panel(0.6));
-        icon_at(ui, slot.center(), icon::X, 14.0, theme::text());
-        if xr.clicked() {
-            acts.push(Action::QueueRemove(i));
-        }
-    }
-    egui::Popup::menu(&more).show(|ui| song_menu(ui, t, o.liked, o.remove, o.queue_move, acts));
+    menu_popup(egui::Popup::menu(&more), MENU_W, |ui| song_menu(ui, t, o.liked, o.remove.as_ref(), o.queue_move, acts));
     // Right-click anywhere on the row opens the same menu.
-    egui::Popup::context_menu(&resp).show(|ui| song_menu(ui, t, o.liked, o.remove, o.queue_move, acts));
+    menu_popup(egui::Popup::context_menu(&resp), MENU_W, |ui| song_menu(ui, t, o.liked, o.remove.as_ref(), o.queue_move, acts));
     resp
 }
 
 /// An 18 px tick box centred on `c`, white like a primary pill when ticked.
-fn checkbox(ui: &Ui, c: Pos2, on: bool) {
+pub(crate) fn checkbox(ui: &Ui, c: Pos2, on: bool) {
     let r = Rect::from_center_size(c, Vec2::splat(18.0));
     if on {
         ui.painter().rect_filled(r, 5.0, theme::text());
@@ -954,10 +1255,11 @@ fn checkbox(ui: &Ui, c: Pos2, on: bool) {
     }
 }
 
-/// Section header with optional strapline/avatar and ‹ › scroll arrows.
-/// Returns (scroll left, scroll right) clicks.
-pub fn shelf_header(ui: &mut Ui, title: &str, strap: Option<&str>, strap_thumb: Option<&str>, arrows: bool) -> (bool, bool) {
-    let mut res = (false, false);
+/// Section header with optional strapline/avatar and ‹ › scroll arrows. `see_all` puts
+/// Apple's chevron on the name itself, the way into the whole section rather than the run
+/// under it. Returns (scroll left, scroll right, see all).
+pub fn shelf_header(ui: &mut Ui, title: &str, strap: Option<&str>, strap_thumb: Option<&str>, arrows: bool, see_all: bool) -> (bool, bool, bool) {
+    let mut res = (false, false, false);
     ui.add_space(34.0);
     ui.horizontal(|ui| {
         if let Some(url) = strap_thumb {
@@ -970,7 +1272,7 @@ pub fn shelf_header(ui: &mut Ui, title: &str, strap: Option<&str>, strap_thumb: 
             if let Some(s) = strap {
                 ui.label(egui::RichText::new(s.to_uppercase()).font(theme::semibold(11.5)).color(theme::text_dim()));
             }
-            ui.label(egui::RichText::new(title).font(theme::bold(21.0)).color(theme::text()));
+            res.2 = section_name(ui, title, see_all);
         });
         if arrows {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -979,8 +1281,25 @@ pub fn shelf_header(ui: &mut Ui, title: &str, strap: Option<&str>, strap_thumb: 
             });
         }
     });
-    ui.add_space(14.0);
+    ui.add_space(11.0);
     res
+}
+
+/// A section's name at heading size. `see_all` makes it Apple's button for the whole
+/// section: the same type with a chevron after it, brightening under the pointer.
+fn section_name(ui: &mut Ui, title: &str, see_all: bool) -> bool {
+    let font = theme::bold(26.0);
+    if !see_all {
+        ui.label(egui::RichText::new(title).font(font).color(theme::text()));
+        return false;
+    }
+    let g = ui.painter().layout_no_wrap(title.to_owned(), font, Color32::PLACEHOLDER);
+    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 30.0, g.size().y), Sense::click());
+    let resp = named(resp, &format!("All {title}")).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered(), 0.15);
+    ui.painter().galley(pos2(rect.left(), rect.center().y - g.size().y / 2.0), g, theme::text());
+    icon_at(ui, pos2(rect.right() - 11.0, rect.center().y), icon::CHEVRON_RIGHT, 15.0, theme::lerp_color(theme::text_dim(), theme::text(), h));
+    resp.clicked()
 }
 
 /// Aligned starts for complete viewport pages, with a full final page.

@@ -36,6 +36,71 @@ const SAVE_EVERY: Duration = Duration::from_secs(5);
 /// The credential the Spotify sign-in (`sp_dc` cookie) is saved under.
 const VAULT: &str = "spotify sp_dc";
 
+/// Spotify's looping canvas for a song, when the listener signed Spotify in and somebody
+/// uploaded one. `None` covers both "no clip" and "no account": neither is a failure.
+/// Answers are kept on disk, so a song is looked up on Spotify once and never again.
+pub async fn canvas(artist: &str, title: &str, ms: u64) -> Option<spotify::Canvas> {
+    let key = format!("{artist} — {title}");
+    if let Some(known) = canvas_cached(&key) {
+        return known.map(|(name, url)| spotify::Canvas { name, url });
+    }
+    let data = crate::data_dir();
+    let Some(cookie) = crate::vault::get(VAULT, &data).and_then(|b| String::from_utf8(b).ok()) else {
+        log::info!("canvas {key}: no Spotify sign-in");
+        return None;
+    };
+    let client = match spotify::Client::connect(Some(&cookie), &data).await {
+        Ok(c) => c,
+        Err(e) => {
+            log::info!("canvas {key}: Spotify wouldn't answer ({e:#})");
+            return None;
+        }
+    };
+    match client.canvas(artist, title, ms).await {
+        Ok(found) => {
+            log::info!("canvas {key}: {}", found.as_ref().map_or_else(|| "none".to_owned(), |c| c.name.clone()));
+            canvas_remember(&key, found.as_ref());
+            found
+        }
+        Err(e) => {
+            log::info!("canvas {key}: {e:#}");
+            None
+        }
+    }
+}
+
+/// Where the answers are kept: the clip's file name and address, or nothing for a song
+/// Spotify has no canvas of.
+fn canvas_index() -> PathBuf {
+    crate::data_dir().join("canvas").join("index.json")
+}
+
+fn canvas_cached(key: &str) -> Option<Option<(String, String)>> {
+    let raw = std::fs::read_to_string(canvas_index()).ok()?;
+    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&raw).ok()?;
+    let v = map.get(key)?;
+    if v.is_null() {
+        return Some(None);
+    }
+    let name = v.get(0)?.as_str()?.to_owned();
+    let url = v.get(1)?.as_str()?.to_owned();
+    Some(Some((name, url)))
+}
+
+fn canvas_remember(key: &str, found: Option<&spotify::Canvas>) {
+    let path = canvas_index();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut map: serde_json::Map<String, serde_json::Value> =
+        std::fs::read_to_string(&path).ok().and_then(|r| serde_json::from_str(&r).ok()).unwrap_or_default();
+    let v = found.map_or(serde_json::Value::Null, |c| serde_json::json!([c.name, c.url]));
+    map.insert(key.to_owned(), v);
+    if let Ok(json) = serde_json::to_string(&map) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
 /// How a song came out of the search.
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Search {
@@ -1232,6 +1297,33 @@ mod tests {
     use super::*;
     use crate::model::Link;
 
+    /// Spotify's answer for a couple of canvases, on the signed-in account. Run alone:
+    /// `cargo test --release -- --ignored transfer::tests::canvas_live --exact --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn canvas_live() {
+        let data = crate::data_dir();
+        let cookie = crate::vault::get(VAULT, &data).and_then(|b| String::from_utf8(b).ok());
+        println!("cookie saved: {}", cookie.is_some());
+        let client = match spotify::Client::connect(cookie.as_deref(), &data).await {
+            Ok(c) => c,
+            Err(e) => {
+                println!("connect failed: {e:#}");
+                return;
+            }
+        };
+        for (artist, title, ms) in [
+            ("Charli xcx", "Guess featuring billie eilish", 193_000),
+            ("Daft Punk", "Get Lucky", 369_000),
+            ("PinkPantheress", "Girl Like Me", 137_000),
+        ] {
+            match client.canvas(artist, title, ms).await {
+                Ok(found) => println!("{artist} — {title}: {found:?}"),
+                Err(e) => println!("{artist} — {title}: ERR {e:#}"),
+            }
+        }
+    }
+
     fn hit(title: &str, artists: &str) -> YtTrack {
         YtTrack {
             id: title.into(),
@@ -1243,6 +1335,7 @@ mod tests {
             track_nr: None,
             plays: None,
             music_video: false,
+            episode: false,
         }
     }
 
