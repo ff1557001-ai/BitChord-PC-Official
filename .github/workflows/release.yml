@@ -144,11 +144,6 @@ jobs:
           if-no-files-found: error
 
   macos:
-    # Every attempt since Nov 23 was cancelled with "The job was not acquired by Runner
-    # of type hosted even after multiple attempts", so waiting on it holds the whole
-    # release behind a pool this account can't reach. A run that does get a machine still
-    # uploads its artifacts, and attach adds them to the published release.
-    continue-on-error: true
     runs-on: macos-latest
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
@@ -161,8 +156,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # The tests run on the Apple silicon runner itself. When that runner is reached they
-      # gate this job's artifacts, but the job no longer gates the release (see above).
+      # The tests run on the Apple silicon runner itself. They gate this job's artifacts,
+      # but not the release, which goes out on Windows and Linux (see attach).
       - name: Test
         run: cargo test --locked --target aarch64-apple-darwin
 
@@ -209,7 +204,13 @@ jobs:
           if-no-files-found: error
 
   attach:
-    if: github.ref_type == 'tag'
+    # always(), because the hosted macOS arm64 pool has refused runner acquisition on
+    # every attempt since Nov 23 and a cancelled job blocks its dependents however the
+    # other two finished. Windows and Linux carry the release; a run that does get a
+    # macOS machine uploads those artifacts to the published release.
+    if: >-
+      github.ref_type == 'tag' && always() &&
+      needs.windows.result == 'success' && needs.linux.result == 'success'
     needs: [windows, linux, macos]
     runs-on: ubuntu-latest
     steps:
